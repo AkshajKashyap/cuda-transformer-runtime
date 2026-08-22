@@ -1,5 +1,13 @@
 cmake_minimum_required(VERSION 3.24)
 
+# Milestone 0 is developed and benchmarked on an Ampere RTX 3050 Laptop GPU.
+# Set this before enabling CUDA so CMake passes explicit sm_86 code generation
+# to nvcc. A -DCMAKE_CUDA_ARCHITECTURES=... command-line value takes precedence.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES "86-real" CACHE STRING
+        "CUDA architectures to generate")
+endif()
+
 project(
     cuda_transformer_runtime
     VERSION 0.1.0
