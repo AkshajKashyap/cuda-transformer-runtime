@@ -23,6 +23,8 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+find_package(CUDAToolkit REQUIRED)
+
 enable_testing()
 
 add_subdirectory(src)

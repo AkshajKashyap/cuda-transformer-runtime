@@ -6,7 +6,7 @@ and performance engineering.
 
 ## Status
 
-Milestone 1 — GPU fundamentals.
+Milestone 2 — matrix multiplication / GEMM.
 
 ## CUDA smoke test
 
@@ -77,4 +77,61 @@ claim.
 Current limitations: the reduction implementations are intentionally simple;
 the atomic version is not deterministic, and the shared-memory version does
 not yet use warp shuffles or other production optimizations. There are no
-tensor, allocator, GEMM, or transformer abstractions in this milestone.
+tensor, allocator, or transformer abstractions in this milestone.
+
+## GEMM
+
+Milestone 2 implements FP32 row-major matrix multiplication, `C = A * B`, for
+`A[M, K]`, `B[K, N]`, and `C[M, N]`. Element `(row, column)` of a matrix with
+`columns` columns is stored at `data[row * columns + column]`.
+
+The naive CUDA kernel uses 16 x 16 thread blocks. A thread at
+`(blockIdx.y * blockDim.y + threadIdx.y, blockIdx.x * blockDim.x + threadIdx.x)`
+computes one `C[row, column]`, reading `K` values from each input matrix. It
+has straightforward but poor data reuse: neighboring output threads repeatedly
+load overlapping A and B values from global memory.
+
+The tiled kernel uses the same 16 x 16 output mapping. A block cooperatively
+loads one 16 x 16 tile from A and one from B into shared memory (2,048 bytes
+total), accumulates products in a register, and repeats over K tiles. Partial
+tiles load zero for out-of-range elements and the final store is bounds checked.
+`__syncthreads()` is required after loading a tile and after consuming it, so
+no thread reads incomplete shared data or overwrites data that another thread
+still needs.
+
+cuBLAS is also tested and benchmarked. It is column-major, so the row-major
+operation is issued as `C^T = B^T * A^T`: the row-major B buffer is passed as
+the first column-major operand with dimensions `N x K`, followed by row-major A
+as `K x M`; the output has leading dimension `N`. No input transpose or copy is
+needed. The wrapper selects `CUBLAS_PEDANTIC_MATH` so this FP32 milestone does
+not silently use Ampere's reduced-precision TF32 tensor-core path.
+
+`cuda_gemm_test` compares CPU, naive CUDA, tiled CUDA, and cuBLAS results for
+`1x1x1`, `3x5x7`, `8x4x13`, `16x16x16`, `17x19x23`, `31x33x29`, and
+`128x96x112`. Its tolerance is
+`1e-4 + 2e-6 * K * max(1, abs(expected))`, scaling modestly with the number of
+FP32 products accumulated into each output element.
+
+Run the focused kernel-only benchmark after building:
+
+```bash
+./build/src/cuda_gemm_benchmark
+```
+
+It benchmarks naive CUDA, tiled CUDA, and cuBLAS for square sizes 64, 128,
+256, 512, and 1024. Device memory allocation and host/device copies occur
+before the measurement. Each method warms up ten times, then CUDA events time
+nine independent batches in the default stream. Each batch contains 1,000
+launches for 64–128, 200 for 256, 50 for 512, or 10 for 1024; the benchmark
+reports the median per-launch batch latency and its corresponding
+`2*M*N*K / time` GFLOP/s. This is kernel-only timing.
+
+Laptop GPU clocks, thermals, and power limits can vary between runs. Small
+GEMMs are especially sensitive to fixed launch and scheduling overhead. Treat
+results as workload- and hardware-specific measurements, not general
+performance claims.
+
+Current GEMM limitations: the handwritten kernels are instructional FP32
+implementations only. They do not use tensor cores, WMMA, asynchronous copies,
+double buffering, register blocking, warp-specialized code, or tuned cuBLAS
+algorithm selection. No transformer operations have been added.
