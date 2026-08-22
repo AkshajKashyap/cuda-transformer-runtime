@@ -1,30 +1,13 @@
 #include <cuda_runtime.h>
 
+#include "cuda_transformer/cuda_check.h"
+
 #include <array>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 
 namespace {
-
-// CUDA calls return an error code instead of throwing exceptions. Checking every
-// call makes setup and transfer failures visible at the operation that caused them.
-bool check_cuda(cudaError_t error, const char* expression, const char* file, int line) {
-    if (error == cudaSuccess) {
-        return true;
-    }
-
-    std::fprintf(stderr,
-                 "CUDA error at %s:%d while evaluating %s: %s\n",
-                 file,
-                 line,
-                 expression,
-                 cudaGetErrorString(error));
-    return false;
-}
-
-#define CUDA_CHECK(expression) \
-    check_cuda((expression), #expression, __FILE__, __LINE__)
 
 // Each CUDA thread updates one array element. The bounds check permits a launch
 // configuration whose total thread count is larger than the input array.
@@ -46,15 +29,15 @@ int main() {
     int* device_values = nullptr;
     const std::size_t bytes = host_values.size() * sizeof(host_values[0]);
 
-    if (!CUDA_CHECK(cudaMalloc(&device_values, bytes))) {
+    if (!CTR_CUDA_CHECK(cudaMalloc(&device_values, bytes))) {
         return EXIT_FAILURE;
     }
 
-    if (!CUDA_CHECK(cudaMemcpy(device_values,
-                               host_values.data(),
-                               bytes,
-                               cudaMemcpyHostToDevice))) {
-        (void)CUDA_CHECK(cudaFree(device_values));
+    if (!CTR_CUDA_CHECK(cudaMemcpy(device_values,
+                                   host_values.data(),
+                                   bytes,
+                                   cudaMemcpyHostToDevice))) {
+        (void)CTR_CUDA_CHECK(cudaFree(device_values));
         return EXIT_FAILURE;
     }
 
@@ -66,20 +49,20 @@ int main() {
 
     // Kernel launches are asynchronous. These two checks surface launch errors
     // and errors encountered while the GPU executes the kernel.
-    if (!CUDA_CHECK(cudaGetLastError()) || !CUDA_CHECK(cudaDeviceSynchronize())) {
-        (void)CUDA_CHECK(cudaFree(device_values));
+    if (!CTR_CUDA_CHECK(cudaGetLastError()) || !CTR_CUDA_CHECK(cudaDeviceSynchronize())) {
+        (void)CTR_CUDA_CHECK(cudaFree(device_values));
         return EXIT_FAILURE;
     }
 
-    if (!CUDA_CHECK(cudaMemcpy(host_values.data(),
-                               device_values,
-                               bytes,
-                               cudaMemcpyDeviceToHost))) {
-        (void)CUDA_CHECK(cudaFree(device_values));
+    if (!CTR_CUDA_CHECK(cudaMemcpy(host_values.data(),
+                                   device_values,
+                                   bytes,
+                                   cudaMemcpyDeviceToHost))) {
+        (void)CTR_CUDA_CHECK(cudaFree(device_values));
         return EXIT_FAILURE;
     }
 
-    if (!CUDA_CHECK(cudaFree(device_values))) {
+    if (!CTR_CUDA_CHECK(cudaFree(device_values))) {
         return EXIT_FAILURE;
     }
 
