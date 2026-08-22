@@ -17,6 +17,10 @@ target_include_directories(cuda_gemm
 target_compile_features(cuda_gemm PUBLIC cxx_std_20)
 target_link_libraries(cuda_gemm PUBLIC CUDA::cublas)
 
+add_library(cuda_transformer_primitives STATIC cuda/transformer_primitives.cu)
+target_include_directories(cuda_transformer_primitives PUBLIC ${PROJECT_SOURCE_DIR}/include)
+target_compile_features(cuda_transformer_primitives PUBLIC cxx_std_20)
+
 add_executable(cuda_smoke_test cuda_smoke_test.cu)
 
 target_compile_features(cuda_smoke_test PRIVATE cxx_std_20)
@@ -37,3 +41,10 @@ add_test(NAME cuda_gemm_test COMMAND cuda_gemm_test)
 
 add_executable(cuda_gemm_benchmark cuda_gemm_benchmark.cu)
 target_link_libraries(cuda_gemm_benchmark PRIVATE cuda_gemm)
+
+add_executable(cuda_transformer_primitives_test cuda_transformer_primitives_test.cu)
+target_link_libraries(cuda_transformer_primitives_test PRIVATE cuda_transformer_primitives)
+add_test(NAME cuda_transformer_primitives_test COMMAND cuda_transformer_primitives_test)
+
+add_executable(cuda_transformer_primitives_benchmark cuda_transformer_primitives_benchmark.cu)
+target_link_libraries(cuda_transformer_primitives_benchmark PRIVATE cuda_transformer_primitives)

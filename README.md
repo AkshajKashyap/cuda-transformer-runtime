@@ -135,3 +135,23 @@ Current GEMM limitations: the handwritten kernels are instructional FP32
 implementations only. They do not use tensor cores, WMMA, asynchronous copies,
 double buffering, register blocking, warp-specialized code, or tuned cuBLAS
 algorithm selection. No transformer operations have been added.
+
+## Transformer primitives
+
+Milestone 3 adds FP32 RMSNorm, numerically stable row-wise softmax, SiLU,
+elementwise multiply, and residual addition. RMSNorm uses one 256-thread block
+per row: threads accumulate strided squared values into 1 KiB shared memory,
+synchronize for the sum reduction, then scale their row elements. Softmax uses
+the same per-row structure for explicit maximum and exponent-sum reductions;
+subtracting the maximum before `exp` prevents overflow. Both require barriers
+after shared-memory writes and reduction steps.
+
+SiLU, multiply, and residual addition are 1D 256-thread, bounds-checked
+kernels and are expected to be memory-bandwidth-bound. RMSNorm and softmax are
+reduction/synchronization-bound hypotheses, not profiler conclusions. Tests use
+`1e-5 + 2e-5 * max(1, abs(expected))`, include rows/widths 1, 17, 256, 257,
+and 32x768, and verify softmax row sums. Zero sizes and nonpositive RMSNorm
+epsilon are rejected. `cuda_transformer_primitives_benchmark` uses ten warmups,
+nine CUDA-event batches of 200 launches, and median kernel-only latency; copies
+and allocations are outside measurement. Attention, masking, RoPE, KV cache,
+FP16, and transformer blocks remain out of scope.
