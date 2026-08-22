@@ -153,5 +153,23 @@ reduction/synchronization-bound hypotheses, not profiler conclusions. Tests use
 and 32x768, and verify softmax row sums. Zero sizes and nonpositive RMSNorm
 epsilon are rejected. `cuda_transformer_primitives_benchmark` uses ten warmups,
 nine CUDA-event batches of 200 launches, and median kernel-only latency; copies
-and allocations are outside measurement. Attention, masking, RoPE, KV cache,
-FP16, and transformer blocks remain out of scope.
+and allocations are outside measurement.
+
+## Causal attention baseline
+
+Milestone 4 uses contiguous FP32 Q, K, and V buffers in `[batch, heads,
+sequence, head_dim]` row-major order. RoPE rotates even/odd Q and K pairs with
+the standard position-dependent frequency; V is unchanged. The visible stages
+are RoPE → scaled QK^T → causal mask → stable row softmax → P×V. Future keys
+receive a large negative logit before max-subtracted softmax.
+
+Scores and probabilities are materialized as `[batch, heads, query, key]`.
+Each FP32 buffer consumes `batch*heads*sequence*sequence*sizeof(float)` bytes,
+so this baseline has intentional O(sequence²) intermediate storage. It is a
+correctness-first, non-fused baseline for future comparisons.
+
+`cuda_attention_benchmark` times RoPE, QK^T, softmax, P×V, and full staged
+attention for `(heads, seq, dim)` `(4,32,64)`, `(4,64,64)`, `(8,128,64)`, and
+`(8,256,64)`. Allocation/copies are excluded; each stage has 10 warm-ups and 9
+CUDA-event batches, using 200, 50, or 10 launches per batch as sequence grows.
+It reports median kernel-only latency and per-shape score/probability size.
