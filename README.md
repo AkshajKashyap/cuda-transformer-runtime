@@ -173,3 +173,32 @@ attention for `(heads, seq, dim)` `(4,32,64)`, `(4,64,64)`, `(8,128,64)`, and
 `(8,256,64)`. Allocation/copies are excluded; each stage has 10 warm-ups and 9
 CUDA-event batches, using 200, 50, or 10 launches per batch as sequence grows.
 It reports median kernel-only latency and per-shape score/probability size.
+
+## KV-cache incremental decode
+
+The contiguous FP32 K and V caches each use `[batch, heads, max_sequence,
+head_dim]`. K is stored after RoPE at its original absolute position; V is
+stored unchanged, and historical K is never rotated again. Prefill supplies
+already-rotated prompt K and raw V. At decode position `t = current_length`,
+new Q/K receive RoPE at `t`, rotated K and V are appended, and the new Q attends
+only to positions `0..t` before producing one output token.
+
+K+V cache storage is `2*batch*heads*max_sequence*head_dim*4` bytes. For batch
+1 and head_dim 64: heads=4 uses 0.25, 0.50, and 1.00 MiB at max_seq 128, 256,
+and 512; heads=8 uses 0.50, 1.00, and 2.00 MiB. Temporary decode workspaces
+are separate from this persistent storage.
+
+Full attention over S tokens performs O(S^2*head_dim) score work and materializes
+O(S^2) values per head. Cached single-token decode reads S K/V entries and does
+O(S*head_dim) score and weighted-V work; it avoids recomputing older K/V
+projections, but per-token work still grows with context length.
+
+`cuda_incremental_attention_benchmark` measures fixed-history full staged decode
+for heads 4/8, head_dim 64, and histories 64/128/256/512/1024/2048. Before every
+launch it restores only `current_length=S`; position S is outside the valid
+prefix and is deterministically overwritten. Allocation/transfers are outside
+timing. Ten warm-ups precede nine CUDA-event batches, with 500 launches at
+64–256, 300 at 512, 200 at 1024, and 100 at 2048; median per-launch kernel-only
+latency is reported. Short-context measurements may be dominated by fixed launch
+overhead, so they need not be monotonic. Q·K and P×V work grows roughly linearly
+with valid history; measurements determine where that scaling becomes visible.
