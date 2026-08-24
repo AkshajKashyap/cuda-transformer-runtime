@@ -25,6 +25,21 @@ add_library(cuda_attention STATIC cuda/attention.cu)
 target_include_directories(cuda_attention PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(cuda_attention PUBLIC cuda_transformer_primitives)
 
+add_library(cuda_kv_cache STATIC cuda/kv_cache.cu)
+target_include_directories(cuda_kv_cache PUBLIC ${PROJECT_SOURCE_DIR}/include)
+
+add_library(cuda_incremental_attention STATIC cuda/incremental_attention.cu)
+target_include_directories(cuda_incremental_attention PUBLIC ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(cuda_incremental_attention PUBLIC cuda_attention cuda_kv_cache)
+
+add_executable(cuda_incremental_attention_test cuda_incremental_attention_test.cu)
+target_link_libraries(cuda_incremental_attention_test PRIVATE cuda_incremental_attention)
+add_test(NAME cuda_incremental_attention_test COMMAND cuda_incremental_attention_test)
+
+add_executable(cuda_kv_cache_test cuda_kv_cache_test.cu)
+target_link_libraries(cuda_kv_cache_test PRIVATE cuda_kv_cache)
+add_test(NAME cuda_kv_cache_test COMMAND cuda_kv_cache_test)
+
 add_executable(cuda_smoke_test cuda_smoke_test.cu)
 
 target_compile_features(cuda_smoke_test PRIVATE cxx_std_20)
