@@ -32,6 +32,21 @@ add_library(cuda_incremental_attention STATIC cuda/incremental_attention.cu)
 target_include_directories(cuda_incremental_attention PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(cuda_incremental_attention PUBLIC cuda_attention cuda_kv_cache)
 
+add_library(cuda_qkv_layout STATIC cuda/qkv_layout.cu)
+target_include_directories(cuda_qkv_layout PUBLIC ${PROJECT_SOURCE_DIR}/include)
+
+add_library(cuda_qkv_projection STATIC cuda/qkv_projection.cu)
+target_include_directories(cuda_qkv_projection PUBLIC ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(cuda_qkv_projection PUBLIC cuda_gemm cuda_qkv_layout)
+
+add_executable(cuda_qkv_projection_test cuda_qkv_projection_test.cu)
+target_link_libraries(cuda_qkv_projection_test PRIVATE cuda_qkv_projection)
+add_test(NAME cuda_qkv_projection_test COMMAND cuda_qkv_projection_test)
+
+add_executable(cuda_qkv_layout_test cuda_qkv_layout_test.cu)
+target_link_libraries(cuda_qkv_layout_test PRIVATE cuda_qkv_layout)
+add_test(NAME cuda_qkv_layout_test COMMAND cuda_qkv_layout_test)
+
 add_executable(cuda_incremental_attention_test cuda_incremental_attention_test.cu)
 target_link_libraries(cuda_incremental_attention_test PRIVATE cuda_incremental_attention)
 add_test(NAME cuda_incremental_attention_test COMMAND cuda_incremental_attention_test)
@@ -60,6 +75,10 @@ target_link_libraries(cuda_vector_timing PRIVATE cuda_fundamentals)
 add_executable(cuda_gemm_test cuda_gemm_test.cu)
 target_link_libraries(cuda_gemm_test PRIVATE cuda_gemm)
 add_test(NAME cuda_gemm_test COMMAND cuda_gemm_test)
+
+add_executable(cuda_linear_test cuda_linear_test.cu)
+target_link_libraries(cuda_linear_test PRIVATE cuda_gemm)
+add_test(NAME cuda_linear_test COMMAND cuda_linear_test)
 
 add_executable(cuda_gemm_benchmark cuda_gemm_benchmark.cu)
 target_link_libraries(cuda_gemm_benchmark PRIVATE cuda_gemm)
