@@ -39,9 +39,29 @@ add_library(cuda_qkv_projection STATIC cuda/qkv_projection.cu)
 target_include_directories(cuda_qkv_projection PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(cuda_qkv_projection PUBLIC cuda_gemm cuda_qkv_layout)
 
+add_library(cuda_normalized_attention_core STATIC cuda/normalized_attention_core.cu)
+target_include_directories(cuda_normalized_attention_core
+    PUBLIC ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(cuda_normalized_attention_core
+    PUBLIC cuda_transformer_primitives cuda_qkv_projection cuda_attention)
+
 add_executable(cuda_qkv_projection_test cuda_qkv_projection_test.cu)
 target_link_libraries(cuda_qkv_projection_test PRIVATE cuda_qkv_projection)
 add_test(NAME cuda_qkv_projection_test COMMAND cuda_qkv_projection_test)
+
+add_executable(cuda_normalized_attention_composition_test
+    cuda_normalized_attention_composition_test.cu)
+target_link_libraries(cuda_normalized_attention_composition_test
+    PRIVATE cuda_qkv_projection cuda_attention cuda_transformer_primitives)
+add_test(NAME cuda_normalized_attention_composition_test
+    COMMAND cuda_normalized_attention_composition_test)
+
+add_executable(cuda_normalized_attention_core_test
+    cuda_normalized_attention_core_test.cu)
+target_link_libraries(cuda_normalized_attention_core_test
+    PRIVATE cuda_normalized_attention_core)
+add_test(NAME cuda_normalized_attention_core_test
+    COMMAND cuda_normalized_attention_core_test)
 
 add_executable(cuda_qkv_layout_test cuda_qkv_layout_test.cu)
 target_link_libraries(cuda_qkv_layout_test PRIVATE cuda_qkv_layout)
