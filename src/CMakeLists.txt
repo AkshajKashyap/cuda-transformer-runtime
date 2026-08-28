@@ -62,6 +62,13 @@ target_include_directories(cuda_decoder_block PUBLIC ${PROJECT_SOURCE_DIR}/inclu
 target_link_libraries(cuda_decoder_block
     PUBLIC cuda_attention_sublayer cuda_mlp_sublayer)
 
+add_library(cuda_incremental_decoder_block STATIC cuda/incremental_decoder_block.cu)
+target_include_directories(cuda_incremental_decoder_block
+    PUBLIC ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(cuda_incremental_decoder_block
+    PUBLIC cuda_qkv_projection cuda_incremental_attention cuda_qkv_layout
+           cuda_gemm cuda_transformer_primitives)
+
 add_executable(cuda_qkv_projection_test cuda_qkv_projection_test.cu)
 target_link_libraries(cuda_qkv_projection_test PRIVATE cuda_qkv_projection)
 add_test(NAME cuda_qkv_projection_test COMMAND cuda_qkv_projection_test)
@@ -104,6 +111,13 @@ target_link_libraries(cuda_incremental_decoder_block_equivalence_test
             cuda_qkv_layout cuda_gemm cuda_transformer_primitives)
 add_test(NAME cuda_incremental_decoder_block_equivalence_test
     COMMAND cuda_incremental_decoder_block_equivalence_test)
+
+add_executable(cuda_incremental_decoder_block_test
+    cuda_incremental_decoder_block_test.cu)
+target_link_libraries(cuda_incremental_decoder_block_test
+    PRIVATE cuda_incremental_decoder_block cuda_decoder_block)
+add_test(NAME cuda_incremental_decoder_block_test
+    COMMAND cuda_incremental_decoder_block_test)
 
 add_executable(cuda_qkv_layout_test cuda_qkv_layout_test.cu)
 target_link_libraries(cuda_qkv_layout_test PRIVATE cuda_qkv_layout)
