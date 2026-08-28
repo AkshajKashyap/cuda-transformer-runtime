@@ -57,6 +57,11 @@ target_include_directories(cuda_mlp_sublayer PUBLIC ${PROJECT_SOURCE_DIR}/includ
 target_link_libraries(cuda_mlp_sublayer
     PUBLIC cuda_gemm cuda_transformer_primitives)
 
+add_library(cuda_decoder_block STATIC cuda/decoder_block.cu)
+target_include_directories(cuda_decoder_block PUBLIC ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(cuda_decoder_block
+    PUBLIC cuda_attention_sublayer cuda_mlp_sublayer)
+
 add_executable(cuda_qkv_projection_test cuda_qkv_projection_test.cu)
 target_link_libraries(cuda_qkv_projection_test PRIVATE cuda_qkv_projection)
 add_test(NAME cuda_qkv_projection_test COMMAND cuda_qkv_projection_test)
@@ -87,6 +92,10 @@ add_test(NAME cuda_swiglu_composition_test COMMAND cuda_swiglu_composition_test)
 add_executable(cuda_mlp_sublayer_test cuda_mlp_sublayer_test.cu)
 target_link_libraries(cuda_mlp_sublayer_test PRIVATE cuda_mlp_sublayer)
 add_test(NAME cuda_mlp_sublayer_test COMMAND cuda_mlp_sublayer_test)
+
+add_executable(cuda_decoder_block_test cuda_decoder_block_test.cu)
+target_link_libraries(cuda_decoder_block_test PRIVATE cuda_decoder_block)
+add_test(NAME cuda_decoder_block_test COMMAND cuda_decoder_block_test)
 
 add_executable(cuda_qkv_layout_test cuda_qkv_layout_test.cu)
 target_link_libraries(cuda_qkv_layout_test PRIVATE cuda_qkv_layout)
