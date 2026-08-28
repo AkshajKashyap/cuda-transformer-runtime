@@ -202,3 +202,30 @@ timing. Ten warm-ups precede nine CUDA-event batches, with 500 launches at
 latency is reported. Short-context measurements may be dominated by fixed launch
 overhead, so they need not be monotonic. Q·K and P×V work grows roughly linearly
 with valid history; measurements determine where that scaling becomes visible.
+
+## Decoder-block decode benchmark
+
+`cuda_decoder_block_decode_benchmark` compares complete FP32 decoder-block
+full-prefix recomputation with the production cached incremental decoder block.
+It uses batch 1, hidden size 256, 4 heads of dimension 64, intermediate size
+512, and RMSNorm epsilons of `1e-5`; both paths share one deterministic weight
+set and input prefix. It covers fixed histories 16, 32, 64, 128, 256, 512, and
+1024. For history `S`, the full path processes `S+1` tokens, while the cached
+path pre-fills tokens `0..S-1` before timing and measures token `S` only.
+
+Run it after building:
+
+```bash
+./build/src/cuda_decoder_block_decode_benchmark
+```
+
+Allocation, host/device transfers, cache prefill, and one per-history output
+sanity check are outside timing. Each path has 10 warm-ups and 9 independent
+CUDA-event timing batches; the reported value is median per-execution latency.
+Before every cached launch, only the logical cache length is restored to `S`, so
+the deterministic token at position `S` overwrites the same invalid cache slot
+without rebuilding history. Full-prefix batches use 200/100/50/20/10/5
+launches at histories 16/32, 64, 128, 256, 512, and 1024 respectively; cached
+batches use 500/500/500/500/300/200/100 launches. This correctness-first
+comparison is a baseline for later decode optimizations, not a production
+performance claim.
