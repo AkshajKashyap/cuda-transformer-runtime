@@ -8,10 +8,15 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cmath>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <vector>
+
+#include <cuda_profiler_api.h>
 
 namespace {
 
@@ -24,6 +29,7 @@ constexpr float kOutputAbsoluteTolerance = 1.0e-3F;
 constexpr float kOutputRelativeTolerance = 2.0e-4F;
 constexpr int kWarmups = 10;
 constexpr int kBatches = 9;
+constexpr int kTraceWarmups = 5;
 
 enum Stage : std::size_t {
   kAttentionRmsNorm,
@@ -77,6 +83,92 @@ struct ProfileResult {
   float stage_total_ms = 0.0F;
   float direct_total_ms = 0.0F;
 };
+
+struct TraceOptions {
+  bool enabled = false;
+  std::size_t history = 0;
+  int iterations = 0;
+};
+
+enum class CommandLineResult { kOk, kHelp, kError };
+
+void print_usage(const char* program) {
+  std::printf(
+      "Usage:\n"
+      "  %s\n"
+      "  %s --trace --history <N> --iterations <N>\n",
+      program, program);
+}
+
+bool parse_positive_size(const char* text, std::size_t* value) {
+  char* end = nullptr;
+  errno = 0;
+  const unsigned long long parsed = std::strtoull(text, &end, 10);
+  if (errno == ERANGE || end == text || *end != '\0' || parsed == 0 ||
+      parsed > std::numeric_limits<std::size_t>::max())
+    return false;
+  *value = static_cast<std::size_t>(parsed);
+  return true;
+}
+
+bool parse_positive_int(const char* text, int* value) {
+  std::size_t parsed = 0;
+  if (!parse_positive_size(text, &parsed) ||
+      parsed > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+    return false;
+  *value = static_cast<int>(parsed);
+  return true;
+}
+
+CommandLineResult parse_command_line(int argc, char** argv,
+                                     TraceOptions* options) {
+  if (argc == 1)
+    return CommandLineResult::kOk;
+
+  bool saw_trace = false;
+  bool saw_history = false;
+  bool saw_iterations = false;
+  for (int index = 1; index < argc; ++index) {
+    if (std::strcmp(argv[index], "--help") == 0) {
+      print_usage(argv[0]);
+      return CommandLineResult::kHelp;
+    }
+    if (std::strcmp(argv[index], "--trace") == 0 && !saw_trace) {
+      saw_trace = true;
+      continue;
+    }
+    if (std::strcmp(argv[index], "--history") == 0 && !saw_history &&
+        index + 1 < argc && parse_positive_size(argv[++index], &options->history)) {
+      saw_history = true;
+      continue;
+    }
+    if (std::strcmp(argv[index], "--iterations") == 0 && !saw_iterations &&
+        index + 1 < argc &&
+        parse_positive_int(argv[++index], &options->iterations)) {
+      saw_iterations = true;
+      continue;
+    }
+    std::fprintf(stderr, "invalid command-line argument: %s\n", argv[index]);
+    print_usage(argv[0]);
+    return CommandLineResult::kError;
+  }
+
+  if (!saw_trace || !saw_history || !saw_iterations) {
+    std::fputs("--trace requires both --history and --iterations\n", stderr);
+    print_usage(argv[0]);
+    return CommandLineResult::kError;
+  }
+  options->enabled = true;
+  return CommandLineResult::kOk;
+}
+
+bool profiler_range_call(cudaError_t error, const char* expression) {
+  // Running trace mode without Nsight may leave CUDA profiling disabled. The
+  // production workload is still useful in that case, just not captured.
+  if (error == cudaSuccess || error == cudaErrorProfilerDisabled)
+    return true;
+  return cuda_transformer::check_cuda(error, expression, __FILE__, __LINE__);
+}
 
 // One event boundary before the first stage and after each following stage.
 // Events are kept for every execution in a batch, then all intervals are read
@@ -428,6 +520,121 @@ bool run_history(cublasHandle_t handle, const DeviceWeights& device_weights,
   return cleanup(true);
 }
 
+bool run_trace(cublasHandle_t handle, const DeviceWeights& device_weights,
+               const float* device_input, TraceOptions options) {
+  using namespace cuda_transformer;
+
+  if (options.history == std::numeric_limits<std::size_t>::max()) {
+    std::fputs("history is too large\n", stderr);
+    return false;
+  }
+  const std::size_t sequence = options.history + 1;
+  const IncrementalDecoderBlockConfig config{
+      kHidden, kHeads, kHeadDim, kIntermediate, kEpsilon, kEpsilon,
+  };
+  const IncrementalDecoderBlockWeights weights{
+      {device_weights.attention_norm, device_weights.wq, device_weights.wk,
+       device_weights.wv, device_weights.wo},
+      {device_weights.mlp_norm, device_weights.w_gate, device_weights.w_up,
+       device_weights.w_down},
+  };
+  KvCache cache;
+  IncrementalDecoderBlockWorkspace workspace;
+  float* composed_output = nullptr;
+  float* production_output = nullptr;
+  auto cleanup = [&](bool ok) {
+    if (composed_output != nullptr && !CTR_CUDA_CHECK(cudaFree(composed_output)))
+      ok = false;
+    if (production_output != nullptr &&
+        !CTR_CUDA_CHECK(cudaFree(production_output)))
+      ok = false;
+    if (!CTR_CUDA_CHECK(incremental_decoder_block_workspace_destroy(&workspace)))
+      ok = false;
+    if (!CTR_CUDA_CHECK(kv_cache_destroy(&cache)))
+      ok = false;
+    return ok;
+  };
+
+  if (!CTR_CUDA_CHECK(kv_cache_create(&cache, 1, kHeads, sequence, kHeadDim)) ||
+      !CTR_CUDA_CHECK(
+          incremental_decoder_block_workspace_create(&workspace, config)) ||
+      !CTR_CUDA_CHECK(cudaMalloc(&composed_output, kHidden * sizeof(float))) ||
+      !CTR_CUDA_CHECK(cudaMalloc(&production_output, kHidden * sizeof(float))))
+    return cleanup(false);
+
+  // This prefill is deliberately before cudaProfilerStart(), so a capture
+  // range contains only the requested fixed-history production decodes.
+  for (std::size_t token = 0; token < options.history; ++token) {
+    if (!CTR_CUBLAS_CHECK(incremental_decoder_block_cuda(
+            handle, device_input + token * kHidden, weights, &cache, &workspace,
+            production_output)))
+      return cleanup(false);
+  }
+  if (!CTR_CUDA_CHECK(cudaDeviceSynchronize()) ||
+      cache.current_length != options.history) {
+    std::fprintf(stderr, "cache prefill failed for history %zu\n",
+                 options.history);
+    return cleanup(false);
+  }
+
+  // Keep the existing composition-vs-production sanity check out of the
+  // capture range. It verifies trace mode still exercises the same API path.
+  cache.current_length = options.history;
+  if (!compose_incremental(handle, device_input + options.history * kHidden,
+                           weights, &cache, &workspace, composed_output) ||
+      !CTR_CUDA_CHECK(cudaDeviceSynchronize()))
+    return cleanup(false);
+  cache.current_length = options.history;
+  if (!CTR_CUBLAS_CHECK(incremental_decoder_block_cuda(
+          handle, device_input + options.history * kHidden, weights, &cache,
+          &workspace, production_output)) ||
+      !CTR_CUDA_CHECK(cudaDeviceSynchronize()))
+    return cleanup(false);
+  std::vector<float> composed_host(kHidden);
+  std::vector<float> production_host(kHidden);
+  if (!CTR_CUDA_CHECK(cudaMemcpy(composed_host.data(), composed_output,
+                                 kHidden * sizeof(float),
+                                 cudaMemcpyDeviceToHost)) ||
+      !CTR_CUDA_CHECK(cudaMemcpy(production_host.data(), production_output,
+                                 kHidden * sizeof(float),
+                                 cudaMemcpyDeviceToHost)) ||
+      !check_output(composed_host, production_host, options.history))
+    return cleanup(false);
+
+  for (int warmup = 0; warmup < kTraceWarmups; ++warmup) {
+    cache.current_length = options.history;
+    if (!CTR_CUBLAS_CHECK(incremental_decoder_block_cuda(
+            handle, device_input + options.history * kHidden, weights, &cache,
+            &workspace, production_output)))
+      return cleanup(false);
+  }
+  if (!CTR_CUDA_CHECK(cudaDeviceSynchronize()))
+    return cleanup(false);
+
+  std::printf("Trace mode: history=%zu iterations=%d warmups=%d\n",
+              options.history, options.iterations, kTraceWarmups);
+  if (!profiler_range_call(cudaProfilerStart(), "cudaProfilerStart()"))
+    return cleanup(false);
+
+  bool ok = true;
+  for (int iteration = 0; iteration < options.iterations; ++iteration) {
+    cache.current_length = options.history;
+    if (!CTR_CUBLAS_CHECK(incremental_decoder_block_cuda(
+            handle, device_input + options.history * kHidden, weights, &cache,
+            &workspace, production_output))) {
+      ok = false;
+      break;
+    }
+  }
+  if (ok && !CTR_CUDA_CHECK(cudaDeviceSynchronize()))
+    ok = false;
+  if (!profiler_range_call(cudaProfilerStop(), "cudaProfilerStop()"))
+    ok = false;
+  if (ok)
+    std::puts("Trace mode complete.");
+  return cleanup(ok);
+}
+
 bool allocate_and_copy(float** device, const std::vector<float>& host) {
   return CTR_CUDA_CHECK(cudaMalloc(device, host.size() * sizeof(float))) &&
          CTR_CUDA_CHECK(cudaMemcpy(*device, host.data(),
@@ -549,16 +756,33 @@ void print_cross_history(const std::vector<ProfileResult>& results) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  TraceOptions trace_options;
+  const CommandLineResult command_line =
+      parse_command_line(argc, argv, &trace_options);
+  if (command_line == CommandLineResult::kHelp)
+    return EXIT_SUCCESS;
+  if (command_line == CommandLineResult::kError)
+    return EXIT_FAILURE;
+  if (trace_options.enabled &&
+      (trace_options.history == std::numeric_limits<std::size_t>::max() ||
+       trace_options.history + 1 >
+           std::numeric_limits<std::size_t>::max() / kHidden)) {
+    std::fputs("trace history is too large\n", stderr);
+    return EXIT_FAILURE;
+  }
+
   constexpr std::array<ProfileConfig, 4> kProfiles{{
       {16, 500, 0.47382F},
       {64, 500, 0.51515F},
       {256, 300, 0.69575F},
       {1024, 100, 0.52362F},
   }};
-  constexpr std::size_t kMaxSequence = kProfiles.back().history + 1;
+  const std::size_t max_sequence =
+      trace_options.enabled ? trace_options.history + 1
+                            : kProfiles.back().history + 1;
 
-  std::vector<float> input(kMaxSequence * kHidden);
+  std::vector<float> input(max_sequence * kHidden);
   for (std::size_t i = 0; i < input.size(); ++i)
     input[i] = static_cast<float>(static_cast<int>((i * 5 + 3) % 37) - 18) /
                32.0F;
@@ -571,20 +795,24 @@ int main() {
             setup_weights(&device_weights);
   std::vector<ProfileResult> results;
   if (ok) {
-    std::puts("Incremental decoder-block stage profile (FP32, batch=1, "
-              "hidden=256, heads=4, head_dim=64, intermediate=512)");
-    for (const ProfileConfig profile_config : kProfiles) {
-      ProfileResult result;
-      if (!run_history(handle, device_weights, device_input, profile_config,
-                       &result)) {
-        ok = false;
-        break;
+    if (trace_options.enabled) {
+      ok = run_trace(handle, device_weights, device_input, trace_options);
+    } else {
+      std::puts("Incremental decoder-block stage profile (FP32, batch=1, "
+                "hidden=256, heads=4, head_dim=64, intermediate=512)");
+      for (const ProfileConfig profile_config : kProfiles) {
+        ProfileResult result;
+        if (!run_history(handle, device_weights, device_input, profile_config,
+                         &result)) {
+          ok = false;
+          break;
+        }
+        print_profile(result);
+        results.push_back(result);
       }
-      print_profile(result);
-      results.push_back(result);
+      if (ok)
+        print_cross_history(results);
     }
-    if (ok)
-      print_cross_history(results);
   }
   if (!free_weights(&device_weights))
     ok = false;

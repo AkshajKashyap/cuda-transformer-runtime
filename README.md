@@ -260,3 +260,31 @@ If Nsight Systems is available, an optional complementary trace is:
 nsys profile --trace=cuda,cublas -o incremental_decoder_block_profile \
   ./build/src/cuda_incremental_decoder_block_profile
 ```
+
+For a low-volume trace of the uninstrumented production incremental API only,
+use trace mode. Cache prefill, the composition-vs-production sanity check, and
+five warm-ups occur before the profiler capture; the capture then contains
+exactly the requested number of fixed-history production decode calls.
+
+```bash
+nsys profile --trace=cuda,cublas --sample=none \
+  --capture-range=cudaProfilerApi --capture-range-end=stop \
+  -o incremental_decode_h16 \
+  ./build/src/cuda_incremental_decoder_block_profile \
+  --trace --history 16 --iterations 20
+
+nsys profile --trace=cuda,cublas --sample=none \
+  --capture-range=cudaProfilerApi --capture-range-end=stop \
+  -o incremental_decode_h1024 \
+  ./build/src/cuda_incremental_decoder_block_profile \
+  --trace --history 1024 --iterations 20
+```
+
+The installed Nsight Systems version supports these summaries:
+
+```bash
+nsys stats --report cuda_gpu_kern_sum --report cuda_api_sum \
+  incremental_decode_h16.nsys-rep
+nsys stats --report cuda_gpu_kern_sum --report cuda_api_sum \
+  incremental_decode_h1024.nsys-rep
+```
