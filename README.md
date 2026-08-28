@@ -229,3 +229,34 @@ launches at histories 16/32, 64, 128, 256, 512, and 1024 respectively; cached
 batches use 500/500/500/500/300/200/100 launches. This correctness-first
 comparison is a baseline for later decode optimizations, not a production
 performance claim.
+
+## Incremental decoder-block stage profiler
+
+`cuda_incremental_decoder_block_profile` profiles the production-equivalent
+FP32 one-token decoder-block composition at fixed histories 16, 64, 256, and
+1024. It uses the same batch-1 shape as the decode benchmark: hidden 256, four
+heads of dimension 64, intermediate size 512, and both RMSNorm epsilons
+`1e-5`.
+
+```bash
+./build/src/cuda_incremental_decoder_block_profile
+```
+
+The profiler pre-fills cache history outside timing, verifies its explicit
+primitive composition against `incremental_decoder_block_cuda`, then records
+CUDA-event boundaries around stages in the same default-stream order. It uses
+10 complete warm-ups, 9 timed batches, and 500/500/300/100 executions per batch
+at the four histories. It reports median per-execution stage latency, each
+stage's percentage of the measured composition, a direct end-to-end timing, and
+the corresponding 6C1 baseline for comparison. The incremental-attention core
+is reported as one group because its RoPE, cache append, QK, softmax, and P×V
+kernels are intentionally encapsulated by the existing API. Event boundaries
+can add profiling overhead; compare the stage sum with the direct timing rather
+than treating either as a new performance claim.
+
+If Nsight Systems is available, an optional complementary trace is:
+
+```bash
+nsys profile --trace=cuda,cublas -o incremental_decoder_block_profile \
+  ./build/src/cuda_incremental_decoder_block_profile
+```

@@ -124,6 +124,11 @@ add_executable(cuda_decoder_block_decode_benchmark
 target_link_libraries(cuda_decoder_block_decode_benchmark
     PRIVATE cuda_decoder_block cuda_incremental_decoder_block)
 
+add_executable(cuda_incremental_decoder_block_profile
+    cuda_incremental_decoder_block_profile.cu)
+target_link_libraries(cuda_incremental_decoder_block_profile
+    PRIVATE cuda_incremental_decoder_block)
+
 add_executable(cuda_qkv_layout_test cuda_qkv_layout_test.cu)
 target_link_libraries(cuda_qkv_layout_test PRIVATE cuda_qkv_layout)
 add_test(NAME cuda_qkv_layout_test COMMAND cuda_qkv_layout_test)
