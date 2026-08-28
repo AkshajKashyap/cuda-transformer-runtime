@@ -97,6 +97,14 @@ add_executable(cuda_decoder_block_test cuda_decoder_block_test.cu)
 target_link_libraries(cuda_decoder_block_test PRIVATE cuda_decoder_block)
 add_test(NAME cuda_decoder_block_test COMMAND cuda_decoder_block_test)
 
+add_executable(cuda_incremental_decoder_block_equivalence_test
+    cuda_incremental_decoder_block_equivalence_test.cu)
+target_link_libraries(cuda_incremental_decoder_block_equivalence_test
+    PRIVATE cuda_decoder_block cuda_qkv_projection cuda_incremental_attention
+            cuda_qkv_layout cuda_gemm cuda_transformer_primitives)
+add_test(NAME cuda_incremental_decoder_block_equivalence_test
+    COMMAND cuda_incremental_decoder_block_equivalence_test)
+
 add_executable(cuda_qkv_layout_test cuda_qkv_layout_test.cu)
 target_link_libraries(cuda_qkv_layout_test PRIVATE cuda_qkv_layout)
 add_test(NAME cuda_qkv_layout_test COMMAND cuda_qkv_layout_test)
