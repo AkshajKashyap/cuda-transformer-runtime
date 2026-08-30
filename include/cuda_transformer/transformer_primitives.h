@@ -5,12 +5,17 @@ namespace cuda_transformer {
 inline constexpr int kPrimitiveThreads = 256;
 void rmsnorm_cpu(const float *, const float *, float *, std::size_t,
                  std::size_t, float);
+void layernorm_cpu(const float *, const float *, const float *, float *,
+                   std::size_t, std::size_t, float);
 void softmax_cpu(const float *, float *, std::size_t, std::size_t);
 void silu_cpu(const float *, float *, std::size_t);
 void multiply_cpu(const float *, const float *, float *, std::size_t);
 void residual_add_cpu(const float *, const float *, float *, std::size_t);
 cudaError_t rmsnorm_cuda(const float *, const float *, float *, std::size_t,
                          std::size_t, float, cudaStream_t = nullptr);
+cudaError_t layernorm_cuda(const float *, const float *, const float *,
+                           float *, std::size_t, std::size_t, float,
+                           cudaStream_t = nullptr);
 cudaError_t softmax_cuda(const float *, float *, std::size_t, std::size_t,
                          cudaStream_t = nullptr);
 cudaError_t silu_cuda(const float *, float *, std::size_t,

@@ -55,7 +55,7 @@ required.
 ## What runs on CUDA
 
 The runtime includes CUDA implementations of vector/reduction fundamentals,
-naive/tiled/cuBLAS GEMM, RMSNorm, stable softmax, RoPE, causal attention,
+naive/tiled/cuBLAS GEMM, RMSNorm, LayerNorm, stable softmax, RoPE, causal attention,
 SwiGLU, KV-cache operations, and a complete decoder block. The full-sequence
 path materializes causal-attention scores/probabilities for clarity; the
 incremental path uses a persistent K/V cache and workspace-owned scratch.
@@ -193,8 +193,8 @@ the focused test sources under `src/`.
 
 - `src/cuda/gemm.cu` and `include/.../gemm.h`: row-major GEMM and cuBLAS
   wrappers.
-- `src/cuda/transformer_primitives.cu`: RMSNorm, softmax, SiLU, multiply, and
-  residual operations.
+- `src/cuda/transformer_primitives.cu`: RMSNorm, LayerNorm, softmax, SiLU,
+  multiply, and residual operations.
 - `src/cuda/attention.cu`, `incremental_attention.cu`, `kv_cache.cu`: causal
   attention, cached attention, and cache ownership.
 - `src/cuda/qkv_projection.cu`, `qkv_layout.cu`: QKV projection workspace and

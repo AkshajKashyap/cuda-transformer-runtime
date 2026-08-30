@@ -1,5 +1,6 @@
 #include "cuda_transformer/transformer_primitives.h"
 #include <cmath>
+#include <limits>
 namespace cuda_transformer {
 namespace {
 int blocks(std::size_t n) {
@@ -39,6 +40,41 @@ __global__ void rms_k(const float *x, const float *w, float *y,
   float rms = rsqrtf(reduce_sum(s, sh) / hidden + eps);
   for (std::size_t i = t; i < hidden; i += blockDim.x)
     y[r * hidden + i] = x[r * hidden + i] * rms * w[i];
+}
+// One block normalizes one [hidden] row. Threads first reduce the row sum,
+// then reduce squared distances from that mean before writing strided outputs.
+__global__ void layernorm_k(const float *x, const float *gamma,
+                            const float *beta, float *y,
+                            std::size_t hidden, float eps) {
+  extern __shared__ float sh[];
+  __shared__ float mean;
+  __shared__ float inverse_stddev;
+  const std::size_t row = blockIdx.x;
+  const int thread = threadIdx.x;
+
+  float sum = 0.0f;
+  for (std::size_t i = thread; i < hidden; i += blockDim.x)
+    sum += x[row * hidden + i];
+  const float total = reduce_sum(sum, sh);
+  if (thread == 0)
+    mean = total / static_cast<float>(hidden);
+  __syncthreads();
+
+  float squared_distance_sum = 0.0f;
+  for (std::size_t i = thread; i < hidden; i += blockDim.x) {
+    const float distance = x[row * hidden + i] - mean;
+    squared_distance_sum += distance * distance;
+  }
+  const float squared_distance_total = reduce_sum(squared_distance_sum, sh);
+  if (thread == 0)
+    inverse_stddev = rsqrtf(squared_distance_total / static_cast<float>(hidden) +
+                            eps);
+  __syncthreads();
+
+  for (std::size_t i = thread; i < hidden; i += blockDim.x)
+    y[row * hidden + i] = (x[row * hidden + i] - mean) * inverse_stddev *
+                              gamma[i] +
+                          beta[i];
 }
 __global__ void soft_k(const float *x, float *y, std::size_t width) {
   extern __shared__ float sh[];
@@ -84,6 +120,26 @@ void rmsnorm_cpu(const float *x, const float *w, float *y, std::size_t rows,
       y[r * h + i] = x[r * h + i] * q * w[i];
   }
 }
+void layernorm_cpu(const float *x, const float *gamma, const float *beta,
+                   float *y, std::size_t rows, std::size_t h, float eps) {
+  for (std::size_t r = 0; r < rows; r++) {
+    float sum = 0.0f;
+    for (std::size_t i = 0; i < h; i++)
+      sum += x[r * h + i];
+    const float mean = sum / static_cast<float>(h);
+
+    float squared_distance_sum = 0.0f;
+    for (std::size_t i = 0; i < h; i++) {
+      const float distance = x[r * h + i] - mean;
+      squared_distance_sum += distance * distance;
+    }
+    const float inverse_stddev =
+        1.0f / std::sqrt(squared_distance_sum / static_cast<float>(h) + eps);
+    for (std::size_t i = 0; i < h; i++)
+      y[r * h + i] =
+          (x[r * h + i] - mean) * inverse_stddev * gamma[i] + beta[i];
+  }
+}
 void softmax_cpu(const float *x, float *y, std::size_t rows, std::size_t n) {
   for (std::size_t r = 0; r < rows; r++) {
     float m = -INFINITY;
@@ -117,6 +173,17 @@ cudaError_t rmsnorm_cuda(const float *x, const float *w, float *y,
     return cudaErrorInvalidValue;
   rms_k<<<rows, kPrimitiveThreads, kPrimitiveThreads * sizeof(float), st>>>(
       x, w, y, h, eps);
+  return cudaGetLastError();
+}
+cudaError_t layernorm_cuda(const float *x, const float *gamma,
+                           const float *beta, float *y, std::size_t rows,
+                           std::size_t h, float eps, cudaStream_t st) {
+  if (!x || !gamma || !beta || !y || !rows || !h || !std::isfinite(eps) ||
+      eps <= 0.0f || rows > std::numeric_limits<unsigned int>::max())
+    return cudaErrorInvalidValue;
+  layernorm_k<<<static_cast<unsigned int>(rows), kPrimitiveThreads,
+                kPrimitiveThreads * sizeof(float), st>>>(x, gamma, beta, y,
+                                                           h, eps);
   return cudaGetLastError();
 }
 cudaError_t softmax_cuda(const float *x, float *y, std::size_t rows,
