@@ -10,7 +10,7 @@ endif()
 
 project(
     cuda_transformer_runtime
-    VERSION 0.1.0
+    VERSION 1.0.0
     LANGUAGES CXX CUDA
 )
 

@@ -1,24 +1,31 @@
 # CUDA Transformer Runtime
 
-A small C++/CUDA transformer inference runtime built to study GPU
-architecture, transformer inference, numerical correctness, profiling,
-and performance engineering.
+A from-scratch CUDA/C++ implementation of a LLaMA-style decoder block with
+KV-cached incremental decoding, CPU-vs-GPU correctness tests,
+profiling-driven optimization, and reproducible performance benchmarks.
 
-## Status
+This is a portfolio and educational systems project, not a complete LLM serving
+engine. It focuses on the parts of transformer inference that expose GPU memory
+layout, CUDA kernels, cuBLAS integration, numerical correctness, and practical
+performance engineering.
 
-Milestone 2 — matrix multiplication / GEMM.
+## At a glance
 
-## CUDA smoke test
+- FP32 pre-norm LLaMA-style decoder block in C++20/CUDA.
+- Full-sequence causal attention and cached one-token incremental decoding.
+- CPU reference implementations and 18/18 CTests passing on the tested RTX
+  3050 Laptop GPU.
+- CUDA-event benchmarks and Nsight Systems trace support.
+- Two Nsight-driven optimizations: no steady-state GPU allocation and a
+  long-context cooperative probability × value (P×V) reduction.
 
-The Milestone 0 smoke test verifies the complete CUDA execution path: device
-allocation, host-to-device transfer, a kernel launch, synchronization,
-device-to-host transfer, and CPU result checking.
+For the representative single-block FP32 workload below, cached decoding at
+1024 tokens of history reduced next-token latency from 7.86 ms to 0.42 ms
+(18.81×) on the tested RTX 3050 Laptop GPU. This is not full-model tokens/sec.
 
-The current development and benchmarking machine has an NVIDIA GeForce RTX
-3050 Laptop GPU (Ampere, compute capability 8.6). By default, CMake therefore
-generates explicit `sm_86` SASS code (`CMAKE_CUDA_ARCHITECTURES=86-real`). This
-avoids relying on the compiler/toolchain's architecture default and matches the
-validated local environment.
+## Quickstart
+
+The project defaults to explicit Ampere `sm_86` SASS for its development GPU.
 
 ```bash
 cmake -S . -B build -G Ninja
@@ -26,288 +33,207 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-To build for another GPU, configure from a clean build directory with an
-explicit override. For example, a GPU with compute capability 7.5 can use:
+Run selected benchmarks after a successful build:
+
+```bash
+./build/src/cuda_gemm_benchmark
+./build/src/cuda_incremental_attention_benchmark
+./build/src/cuda_incremental_pv_benchmark
+./build/src/cuda_decoder_block_decode_benchmark
+```
+
+For a different GPU, supply an explicit override—for example:
 
 ```bash
 cmake -S . -B build -G Ninja -DCMAKE_CUDA_ARCHITECTURES=75-real
 ```
 
-The command-line value overrides the project's `86-real` default. This
-configuration produces SASS only for the selected architecture; it
-does not yet include multi-architecture or PTX-forward-compatibility support.
+The override replaces the `86-real` default. The project has been validated on
+one CUDA environment only; compatible GPU, driver, and toolkit versions are
+required.
 
-## GPU fundamentals
+## What runs on CUDA
 
-Milestone 1 adds CPU references and CUDA implementations for float vector
-addition, scalar multiplication, and summation. The vector kernels launch 256
-threads per block. Thread `blockIdx.x * blockDim.x + threadIdx.x` handles one
-element, so adjacent threads access adjacent floats in global memory. A bounds
-check is necessary because the final block is often only partly occupied.
+The runtime includes CUDA implementations of vector/reduction fundamentals,
+naive/tiled/cuBLAS GEMM, RMSNorm, stable softmax, RoPE, causal attention,
+SwiGLU, KV-cache operations, and a complete decoder block. The full-sequence
+path materializes causal-attention scores/probabilities for clarity; the
+incremental path uses a persistent K/V cache and workspace-owned scratch.
 
-The reduction has two learning-oriented implementations:
+### Full-sequence decoder block
 
-- `sum_atomic_cuda` is a direct reference that atomically adds one element per
-  thread into one result. Its floating-point summation order is nondeterministic.
-- `sum_shared_cuda` has each 256-thread block load and reduce up to 512 values
-  in shared memory, then writes one partial sum. It repeatedly launches the
-  same block reduction on the partial sums until one result remains.
-
-`__syncthreads()` is required after loading shared memory and after every
-reduction step: without it, a thread could read a partner value before that
-thread has written it.
-
-`cuda_fundamentals_test` compares every GPU result with a deterministic CPU
-reference for sizes 1, 17, 255, 256, 257, 513, and 65,537. It uses an absolute
-tolerance of `1e-5` plus a relative tolerance of `1e-5`, which accommodates
-the different valid floating-point addition orders in reductions.
-
-Run the timing sample after building:
-
-```bash
-./build/src/cuda_vector_timing
+```text
+X
+→ RMSNorm
+→ Q/K/V projections
+→ token-major → head-major repack
+→ RoPE(Q, K)
+→ causal attention
+→ head-major → token-major repack
+→ output projection
+→ residual
+→ RMSNorm
+→ gate/up projections
+→ SiLU(gate) * up
+→ down projection
+→ residual
 ```
 
-It warms up vector addition ten times, records CUDA events around 100 further
-kernel launches in the default stream, waits for the stop event, and reports
-the average kernel-only latency. Host/device copies and allocation are outside
-the timed interval. This is measurement infrastructure, not a performance
-claim.
+### Incremental cached decode
 
-Current limitations: the reduction implementations are intentionally simple;
-the atomic version is not deterministic, and the shared-memory version does
-not yet use warp shuffles or other production optimizations. There are no
-tensor, allocator, or transformer abstractions in this milestone.
-
-## GEMM
-
-Milestone 2 implements FP32 row-major matrix multiplication, `C = A * B`, for
-`A[M, K]`, `B[K, N]`, and `C[M, N]`. Element `(row, column)` of a matrix with
-`columns` columns is stored at `data[row * columns + column]`.
-
-The naive CUDA kernel uses 16 x 16 thread blocks. A thread at
-`(blockIdx.y * blockDim.y + threadIdx.y, blockIdx.x * blockDim.x + threadIdx.x)`
-computes one `C[row, column]`, reading `K` values from each input matrix. It
-has straightforward but poor data reuse: neighboring output threads repeatedly
-load overlapping A and B values from global memory.
-
-The tiled kernel uses the same 16 x 16 output mapping. A block cooperatively
-loads one 16 x 16 tile from A and one from B into shared memory (2,048 bytes
-total), accumulates products in a register, and repeats over K tiles. Partial
-tiles load zero for out-of-range elements and the final store is bounds checked.
-`__syncthreads()` is required after loading a tile and after consuming it, so
-no thread reads incomplete shared data or overwrites data that another thread
-still needs.
-
-cuBLAS is also tested and benchmarked. It is column-major, so the row-major
-operation is issued as `C^T = B^T * A^T`: the row-major B buffer is passed as
-the first column-major operand with dimensions `N x K`, followed by row-major A
-as `K x M`; the output has leading dimension `N`. No input transpose or copy is
-needed. The wrapper selects `CUBLAS_PEDANTIC_MATH` so this FP32 milestone does
-not silently use Ampere's reduced-precision TF32 tensor-core path.
-
-`cuda_gemm_test` compares CPU, naive CUDA, tiled CUDA, and cuBLAS results for
-`1x1x1`, `3x5x7`, `8x4x13`, `16x16x16`, `17x19x23`, `31x33x29`, and
-`128x96x112`. Its tolerance is
-`1e-4 + 2e-6 * K * max(1, abs(expected))`, scaling modestly with the number of
-FP32 products accumulated into each output element.
-
-Run the focused kernel-only benchmark after building:
-
-```bash
-./build/src/cuda_gemm_benchmark
+```text
+X_t
+→ attention RMSNorm
+→ Q/K/V projections
+→ token-major → head-major repack
+→ RoPE(Q_t, K_t) at absolute cache position t
+→ append rotated K_t + raw V_t
+→ attention against cached K/V
+→ Wo
+→ residual
+→ SwiGLU MLP
+→ residual
 ```
 
-It benchmarks naive CUDA, tiled CUDA, and cuBLAS for square sizes 64, 128,
-256, 512, and 1024. Device memory allocation and host/device copies occur
-before the measurement. Each method warms up ten times, then CUDA events time
-nine independent batches in the default stream. Each batch contains 1,000
-launches for 64–128, 200 for 256, 50 for 512, or 10 for 1024; the benchmark
-reports the median per-launch batch latency and its corresponding
-`2*M*N*K / time` GFLOP/s. This is kernel-only timing.
+QKV projections naturally produce token-major `[sequence, hidden]` buffers,
+while attention accesses each head’s sequence contiguously. Explicit repacks
+make that change visible rather than hiding it behind a tensor abstraction.
+The cache uses `[batch, heads, max_sequence, head_dim]`: K is stored after
+RoPE, V remains raw, and `current_length` is the absolute position for the next
+decoded token. Historical K is never rotated again.
 
-Laptop GPU clocks, thermals, and power limits can vary between runs. Small
-GEMMs are especially sensitive to fixed launch and scheduling overhead. Treat
-results as workload- and hardware-specific measurements, not general
-performance claims.
+More detail: [architecture](docs/architecture.md).
 
-Current GEMM limitations: the handwritten kernels are instructional FP32
-implementations only. They do not use tensor cores, WMMA, asynchronous copies,
-double buffering, register blocking, warp-specialized code, or tuned cuBLAS
-algorithm selection. No transformer operations have been added.
+## Performance
 
-## Transformer primitives
+All figures below are real-GPU measurements for batch 1, one FP32 decoder
+block, hidden size 256, 4 heads × 64 dimensions, MLP intermediate size 512.
+CUDA events measure kernel-only work; allocations and host/device transfers are
+outside the timed region. Laptop clocks, power limits, and DVFS can vary, so
+these results are workload- and hardware-specific.
 
-Milestone 3 adds FP32 RMSNorm, numerically stable row-wise softmax, SiLU,
-elementwise multiply, and residual addition. RMSNorm uses one 256-thread block
-per row: threads accumulate strided squared values into 1 KiB shared memory,
-synchronize for the sum reduction, then scale their row elements. Softmax uses
-the same per-row structure for explicit maximum and exponent-sum reductions;
-subtracting the maximum before `exp` prevents overflow. Both require barriers
-after shared-memory writes and reduction steps.
+### Full prefix vs cached next-token decode
 
-SiLU, multiply, and residual addition are 1D 256-thread, bounds-checked
-kernels and are expected to be memory-bandwidth-bound. RMSNorm and softmax are
-reduction/synchronization-bound hypotheses, not profiler conclusions. Tests use
-`1e-5 + 2e-5 * max(1, abs(expected))`, include rows/widths 1, 17, 256, 257,
-and 32x768, and verify softmax row sums. Zero sizes and nonpositive RMSNorm
-epsilon are rejected. `cuda_transformer_primitives_benchmark` uses ten warmups,
-nine CUDA-event batches of 200 launches, and median kernel-only latency; copies
-and allocations are outside measurement.
+| History | Full-prefix ms | Cached ms | Speedup |
+| ---: | ---: | ---: | ---: |
+| 16 | 0.56269 | 0.44469 | 1.27× |
+| 32 | 0.47918 | 0.38257 | 1.25× |
+| 64 | 0.48190 | 0.41284 | 1.17× |
+| 128 | 0.47434 | 0.39564 | 1.20× |
+| 256 | 0.85171 | 0.42340 | 2.01× |
+| 512 | 2.42635 | 0.34323 | 7.07× |
+| 1024 | 7.86487 | 0.41812 | 18.81× |
 
-## Causal attention baseline
+Full-prefix recomputation processes `S+1` tokens. Cached decode pre-fills
+history outside timing, resets only logical cache length before each repeated
+launch, and overwrites the deterministic next-token slot.
 
-Milestone 4 uses contiguous FP32 Q, K, and V buffers in `[batch, heads,
-sequence, head_dim]` row-major order. RoPE rotates even/odd Q and K pairs with
-the standard position-dependent frequency; V is unchanged. The visible stages
-are RoPE → scaled QK^T → causal mask → stable row softmax → P×V. Future keys
-receive a large negative logit before max-subtracted softmax.
+### P×V microbenchmark
 
-Scores and probabilities are materialized as `[batch, heads, query, key]`.
-Each FP32 buffer consumes `batch*heads*sequence*sequence*sizeof(float)` bytes,
-so this baseline has intentional O(sequence²) intermediate storage. It is a
-correctness-first, non-fused baseline for future comparisons.
+| History | Serial µs | Cooperative µs | Speedup |
+| ---: | ---: | ---: | ---: |
+| 16 | 21.465 | 16.667 | 1.29× |
+| 32 | 18.334 | 22.112 | 0.83× |
+| 64 | 22.493 | 27.177 | 0.83× |
+| 128 | 17.183 | 22.036 | 0.78× |
+| 256 | 23.681 | 22.128 | 1.07× |
+| 512 | 30.474 | 22.697 | 1.34× |
+| 1024 | 64.338 | 25.118 | 2.56× |
+| 2048 | 211.456 | 47.870 | 4.42× |
 
-`cuda_attention_benchmark` times RoPE, QK^T, softmax, P×V, and full staged
-attention for `(heads, seq, dim)` `(4,32,64)`, `(4,64,64)`, `(8,128,64)`, and
-`(8,256,64)`. Allocation/copies are excluded; each stage has 10 warm-ups and 9
-CUDA-event batches, using 200, 50, or 10 launches per batch as sequence grows.
-It reports median kernel-only latency and per-shape score/probability size.
+The production path remains serial below history 512 and uses the cooperative
+kernel at 512 and above. That cutoff is empirical for this RTX 3050 benchmark
+environment and model shape, not a portability claim.
 
-## KV-cache incremental decode
+See [performance notes](docs/performance.md) for methodology and the complete
+profiling narrative.
 
-The contiguous FP32 K and V caches each use `[batch, heads, max_sequence,
-head_dim]`. K is stored after RoPE at its original absolute position; V is
-stored unchanged, and historical K is never rotated again. Prefill supplies
-already-rotated prompt K and raw V. At decode position `t = current_length`,
-new Q/K receive RoPE at `t`, rotated K and V are appended, and the new Q attends
-only to positions `0..t` before producing one output token.
+## Profiling and optimization
 
-K+V cache storage is `2*batch*heads*max_sequence*head_dim*4` bytes. For batch
-1 and head_dim 64: heads=4 uses 0.25, 0.50, and 1.00 MiB at max_seq 128, 256,
-and 512; heads=8 uses 0.50, 1.00, and 2.00 MiB. Temporary decode workspaces
-are separate from this persistent storage.
+Correctness came first. Nsight Systems then guided two isolated hot-path
+changes:
 
-Full attention over S tokens performs O(S^2*head_dim) score work and materializes
-O(S^2) values per head. Cached single-token decode reads S K/V entries and does
-O(S*head_dim) score and weighted-V work; it avoids recomputing older K/V
-projections, but per-token work still grows with context length.
+1. The initial incremental path made three `cudaMalloc` and three `cudaFree`
+   calls per decoded token for rotated Q, rotated K, and score scratch.
+   `IncrementalAttentionWorkspace` moved those buffers to workspace creation,
+   so successful steady-state production decode makes zero dynamic GPU
+   allocation calls.
+2. Reprofiling showed serial P×V dominating long-context GPU kernel time.
+   P×V now has one cooperative CUDA block per `(head, output_dimension)` for
+   long histories, selected using the measured cutoff above.
 
-`cuda_incremental_attention_benchmark` measures fixed-history full staged decode
-for heads 4/8, head_dim 64, and histories 64/128/256/512/1024/2048. Before every
-launch it restores only `current_length=S`; position S is outside the valid
-prefix and is deterministically overwritten. Allocation/transfers are outside
-timing. Ten warm-ups precede nine CUDA-event batches, with 500 launches at
-64–256, 300 at 512, 200 at 1024, and 100 at 2048; median per-launch kernel-only
-latency is reported. Short-context measurements may be dominated by fixed launch
-overhead, so they need not be monotonic. Q·K and P×V work grows roughly linearly
-with valid history; measurements determine where that scaling becomes visible.
+No precise whole-runtime gain is attributed to the allocation change because
+cross-run laptop-GPU conditions were noisy. The P×V table is the controlled
+same-session old/new evidence.
 
-Steady-state production decoder-block decode preallocates its incremental
-attention scratch with its workspace: rotated Q and K each contain
-`heads*head_dim` FP32 values, and the in-place score/probability buffer contains
-`heads*max_sequence`. The caller still owns the KV cache, whose fixed capacity
-must match the workspace. `incremental_decoder_block_cuda` uses this no-allocation
-path; it does not call `cudaMalloc` or `cudaFree` during a successful decode.
-The legacy `incremental_decode` convenience wrapper remains available and
-allocates temporary workspace for its single call.
-
-`cuda_incremental_pv_benchmark` compares the retained serial incremental P×V
-kernel with its cooperative-reduction implementation for heads=4, head_dim=64,
-and histories 16 through 2048. It excludes setup and transfers, uses 10 warmups
-and 9 CUDA-event batches, and reports median per-launch microseconds.
+Collect a low-volume production trace:
 
 ```bash
-./build/src/cuda_incremental_pv_benchmark
-```
-
-The production incremental-attention path keeps the serial kernel below history
-512 and uses the cooperative P×V kernel at history 512 and above. This threshold
-is empirical for the RTX 3050 Laptop GPU and this benchmark shape, derived from
-the existing P×V microbenchmark; it is not a portability claim.
-
-## Decoder-block decode benchmark
-
-`cuda_decoder_block_decode_benchmark` compares complete FP32 decoder-block
-full-prefix recomputation with the production cached incremental decoder block.
-It uses batch 1, hidden size 256, 4 heads of dimension 64, intermediate size
-512, and RMSNorm epsilons of `1e-5`; both paths share one deterministic weight
-set and input prefix. It covers fixed histories 16, 32, 64, 128, 256, 512, and
-1024. For history `S`, the full path processes `S+1` tokens, while the cached
-path pre-fills tokens `0..S-1` before timing and measures token `S` only.
-
-Run it after building:
-
-```bash
-./build/src/cuda_decoder_block_decode_benchmark
-```
-
-Allocation, host/device transfers, cache prefill, and one per-history output
-sanity check are outside timing. Each path has 10 warm-ups and 9 independent
-CUDA-event timing batches; the reported value is median per-execution latency.
-Before every cached launch, only the logical cache length is restored to `S`, so
-the deterministic token at position `S` overwrites the same invalid cache slot
-without rebuilding history. Full-prefix batches use 200/100/50/20/10/5
-launches at histories 16/32, 64, 128, 256, 512, and 1024 respectively; cached
-batches use 500/500/500/500/300/200/100 launches. This correctness-first
-comparison is a baseline for later decode optimizations, not a production
-performance claim.
-
-## Incremental decoder-block stage profiler
-
-`cuda_incremental_decoder_block_profile` profiles the production-equivalent
-FP32 one-token decoder-block composition at fixed histories 16, 64, 256, and
-1024. It uses the same batch-1 shape as the decode benchmark: hidden 256, four
-heads of dimension 64, intermediate size 512, and both RMSNorm epsilons
-`1e-5`.
-
-```bash
-./build/src/cuda_incremental_decoder_block_profile
-```
-
-The profiler pre-fills cache history outside timing, verifies its explicit
-primitive composition against `incremental_decoder_block_cuda`, then records
-CUDA-event boundaries around stages in the same default-stream order. It uses
-10 complete warm-ups, 9 timed batches, and 500/500/300/100 executions per batch
-at the four histories. It reports median per-execution stage latency, each
-stage's percentage of the measured composition, a direct end-to-end timing, and
-the corresponding 6C1 baseline for comparison. The incremental-attention core
-is reported as one group because its RoPE, cache append, QK, softmax, and P×V
-kernels are intentionally encapsulated by the existing API. Event boundaries
-can add profiling overhead; compare the stage sum with the direct timing rather
-than treating either as a new performance claim.
-
-If Nsight Systems is available, an optional complementary trace is:
-
-```bash
-nsys profile --trace=cuda,cublas -o incremental_decoder_block_profile \
-  ./build/src/cuda_incremental_decoder_block_profile
-```
-
-For a low-volume trace of the uninstrumented production incremental API only,
-use trace mode. Cache prefill, the composition-vs-production sanity check, and
-five warm-ups occur before the profiler capture; the capture then contains
-exactly the requested number of fixed-history production decode calls.
-
-```bash
-nsys profile --trace=cuda,cublas --sample=none \
-  --capture-range=cudaProfilerApi --capture-range-end=stop \
-  -o incremental_decode_h16 \
-  ./build/src/cuda_incremental_decoder_block_profile \
-  --trace --history 16 --iterations 20
-
 nsys profile --trace=cuda,cublas --sample=none \
   --capture-range=cudaProfilerApi --capture-range-end=stop \
   -o incremental_decode_h1024 \
   ./build/src/cuda_incremental_decoder_block_profile \
   --trace --history 1024 --iterations 20
-```
 
-The installed Nsight Systems version supports these summaries:
-
-```bash
-nsys stats --report cuda_gpu_kern_sum --report cuda_api_sum \
-  incremental_decode_h16.nsys-rep
 nsys stats --report cuda_gpu_kern_sum --report cuda_api_sum \
   incremental_decode_h1024.nsys-rep
 ```
+
+## Correctness methodology
+
+Trusted CPU references are compared against CUDA results using operation-specific
+FP32 absolute-plus-relative tolerances. Tests include awkward and
+non-power-of-two shapes, causal masking and row-sum checks, cache-prefix
+preservation, and token-by-token full-sequence versus incremental equivalence.
+They also validate the complete decoder block. The authoritative real-GPU
+result is **18/18 CTests passing**. Exact test cases and tolerances are kept in
+the focused test sources under `src/`.
+
+## Repository map
+
+- `src/cuda/gemm.cu` and `include/.../gemm.h`: row-major GEMM and cuBLAS
+  wrappers.
+- `src/cuda/transformer_primitives.cu`: RMSNorm, softmax, SiLU, multiply, and
+  residual operations.
+- `src/cuda/attention.cu`, `incremental_attention.cu`, `kv_cache.cu`: causal
+  attention, cached attention, and cache ownership.
+- `src/cuda/qkv_projection.cu`, `qkv_layout.cu`: QKV projection workspace and
+  explicit layout conversions.
+- `src/cuda/attention_sublayer.cu`, `mlp_sublayer.cu`, `decoder_block.cu`:
+  full decoder-block composition.
+- `src/cuda/incremental_decoder_block.cu`: production cached one-token block.
+- `src/*benchmark.cu`: standalone CUDA-event benchmarks; `src/*test.cu`:
+  CTest executables and CPU/GPU checks.
+
+## Environment and reproducibility
+
+Validated environment: WSL2 Ubuntu, NVIDIA GeForce RTX 3050 Laptop GPU
+(compute capability 8.6), CUDA Toolkit 13.3 / nvcc 13.3.73, GCC 13.3, CMake
+3.28, and Ninja. The CMake default is `CMAKE_CUDA_ARCHITECTURES=86-real`, which
+produces explicit `sm_86` code for this development machine while permitting a
+command-line override.
+
+## Limitations
+
+- FP32 only; no FP16/BF16, Tensor Core, or quantized path.
+- One decoder block, not complete pretrained-model inference.
+- No checkpoint loader, tokenizer, embeddings, LM head, sampling, or generation
+  loop.
+- No FlashAttention, paged KV cache, CUDA Graphs, or multi-layer/multi-GPU
+  execution.
+- Incremental decode is batch-1 focused.
+- Handwritten kernels favor educational clarity and measured bottlenecks, not
+  competition with mature inference libraries.
+- Results were measured on one laptop GPU and may not generalize.
+
+## Further reading
+
+- [Architecture](docs/architecture.md)
+- [Performance](docs/performance.md)
+- [Interview notes](docs/interview_notes.md)
+- [Release checklist](docs/release_checklist.md)
+- [Portfolio measurement report](reports/portfolio/v1.0.0.md)
+
+## License
+
+MIT; see [LICENSE](LICENSE).
