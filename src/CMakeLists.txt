@@ -62,6 +62,11 @@ target_include_directories(cuda_decoder_block PUBLIC ${PROJECT_SOURCE_DIR}/inclu
 target_link_libraries(cuda_decoder_block
     PUBLIC cuda_attention_sublayer cuda_mlp_sublayer)
 
+add_library(cuda_tiny_model STATIC cuda/tiny_model.cu)
+target_include_directories(cuda_tiny_model PUBLIC ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(cuda_tiny_model
+    PUBLIC cuda_decoder_block cuda_transformer_primitives cuda_gemm)
+
 add_library(cuda_incremental_decoder_block STATIC cuda/incremental_decoder_block.cu)
 target_include_directories(cuda_incremental_decoder_block
     PUBLIC ${PROJECT_SOURCE_DIR}/include)
@@ -103,6 +108,10 @@ add_test(NAME cuda_mlp_sublayer_test COMMAND cuda_mlp_sublayer_test)
 add_executable(cuda_decoder_block_test cuda_decoder_block_test.cu)
 target_link_libraries(cuda_decoder_block_test PRIVATE cuda_decoder_block)
 add_test(NAME cuda_decoder_block_test COMMAND cuda_decoder_block_test)
+
+add_executable(cuda_tiny_model_test cuda_tiny_model_test.cu)
+target_link_libraries(cuda_tiny_model_test PRIVATE cuda_tiny_model)
+add_test(NAME cuda_tiny_model_test COMMAND cuda_tiny_model_test)
 
 add_executable(cuda_incremental_decoder_block_equivalence_test
     cuda_incremental_decoder_block_equivalence_test.cu)

@@ -11,10 +11,13 @@ performance engineering.
 
 ## At a glance
 
-- FP32 pre-norm LLaMA-style decoder block in C++20/CUDA.
+- FP32 pre-norm LLaMA-style decoder blocks and tiny model-level forward path
+  in C++20/CUDA.
 - Full-sequence causal attention and cached one-token incremental decoding.
-- CPU reference implementations and 18/18 CTests passing on the tested RTX
-  3050 Laptop GPU.
+- Complete model-level LLaMA-style forward execution from integer token IDs to
+  vocabulary logits using deterministic or caller-supplied weights.
+- CPU reference implementations and focused CTest coverage for each composed
+  stage.
 - CUDA-event benchmarks and Nsight Systems trace support.
 - Two Nsight-driven optimizations: no steady-state GPU allocation and a
   long-context cooperative probability × value (P×V) reduction.
@@ -55,10 +58,11 @@ required.
 ## What runs on CUDA
 
 The runtime includes CUDA implementations of vector/reduction fundamentals,
-naive/tiled/cuBLAS GEMM, RMSNorm, LayerNorm, stable softmax, RoPE, causal attention,
-SwiGLU, KV-cache operations, and a complete decoder block. The full-sequence
-path materializes causal-attention scores/probabilities for clarity; the
-incremental path uses a persistent K/V cache and workspace-owned scratch.
+naive/tiled/cuBLAS GEMM, RMSNorm, LayerNorm, stable softmax, RoPE, causal
+attention, SwiGLU, KV-cache operations, decoder blocks, and a tiny complete
+model forward path. The full-sequence path materializes causal-attention
+scores/probabilities for clarity; the incremental path uses a persistent K/V
+cache and workspace-owned scratch.
 
 ### Full-sequence decoder block
 
@@ -78,6 +82,24 @@ X
 → down projection
 → residual
 ```
+
+### Tiny model-level forward
+
+```text
+device token IDs [sequence]
+→ embedding lookup [sequence, hidden]
+→ configurable count of full-sequence decoder blocks
+→ final RMSNorm
+→ LM-head projection
+→ logits [sequence, vocabulary]
+```
+
+The core model API is device-native and enqueues this path without a host-to-
+device token copy or synchronization. A separate convenience wrapper accepts
+host token IDs, validates them, and copies them into workspace-owned device
+storage. The model uses two reusable activation buffers: layers alternate their
+input/output roles, so odd and even layer counts both select the correct final
+activation without dynamic GPU allocation during forward execution.
 
 ### Incremental cached decode
 
@@ -185,9 +207,9 @@ Trusted CPU references are compared against CUDA results using operation-specifi
 FP32 absolute-plus-relative tolerances. Tests include awkward and
 non-power-of-two shapes, causal masking and row-sum checks, cache-prefix
 preservation, and token-by-token full-sequence versus incremental equivalence.
-They also validate the complete decoder block. The authoritative real-GPU
-result is **18/18 CTests passing**. Exact test cases and tolerances are kept in
-the focused test sources under `src/`.
+They also validate complete decoder blocks and the tiny model's CPU/GPU logits.
+Exact test cases and tolerances are kept in the focused test sources under
+`src/`.
 
 ## Repository map
 
@@ -201,6 +223,8 @@ the focused test sources under `src/`.
   explicit layout conversions.
 - `src/cuda/attention_sublayer.cu`, `mlp_sublayer.cu`, `decoder_block.cu`:
   full decoder-block composition.
+- `src/cuda/tiny_model.cu`: device-native embedding-to-logits model
+  orchestration and a CPU correctness oracle.
 - `src/cuda/incremental_decoder_block.cu`: production cached one-token block.
 - `src/*benchmark.cu`: standalone CUDA-event benchmarks; `src/*test.cu`:
   CTest executables and CPU/GPU checks.
@@ -216,12 +240,11 @@ command-line override.
 ## Limitations
 
 - FP32 only; no FP16/BF16, Tensor Core, or quantized path.
-- One decoder block, not complete pretrained-model inference.
-- No checkpoint loader, tokenizer, embeddings, LM head, sampling, or generation
-  loop.
-- No FlashAttention, paged KV cache, CUDA Graphs, or multi-layer/multi-GPU
-  execution.
-- Incremental decode is batch-1 focused.
+- No pretrained checkpoint loader or real pretrained-model inference.
+- No tokenizer, generation loop, or sampling.
+- No model-level incremental decoding or KV-cache orchestration.
+- No FlashAttention, paged KV cache, CUDA Graphs, or multi-GPU execution.
+- Batch size is 1 for both the tiny full-sequence model and incremental decode.
 - Handwritten kernels favor educational clarity and measured bottlenecks, not
   competition with mature inference libraries.
 - Results were measured on one laptop GPU and may not generalize.

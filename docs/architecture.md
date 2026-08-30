@@ -1,8 +1,9 @@
 # Architecture
 
-`cuda-transformer-runtime` is a small FP32 C++20/CUDA runtime centered on one
-LLaMA-style pre-norm decoder block. It deliberately exposes buffers and stages
-instead of hiding them behind a general tensor framework.
+`cuda-transformer-runtime` is a small FP32 C++20/CUDA runtime with LLaMA-style
+pre-norm decoder blocks and a tiny model-level embedding-to-logits path. It
+deliberately exposes buffers and stages instead of hiding them behind a general
+tensor framework.
 
 ## Layouts
 
@@ -31,6 +32,25 @@ X → RMSNorm → QKV → repack → RoPE(Q,K) → causal attention
 Full attention materializes `[batch, heads, query, key]` score and probability
 buffers. This O(sequence²) baseline is intentional: it is easy to audit and
 acts as a correctness reference for later work.
+
+## Tiny model flow
+
+`tiny_model_forward_cuda` is device-native: callers supply device token IDs
+`[sequence]`, a caller-owned logits buffer `[sequence, vocabulary_size]`, a
+cuBLAS handle, and caller-owned device weights. It enqueues:
+
+```text
+token IDs → embedding lookup → decoder block 0 → ... → decoder block N-1
+          → final RMSNorm → LM-head GEMM → vocabulary logits
+```
+
+The model workspace owns two `[sequence, hidden]` activation buffers. Embedding
+writes A, each decoder block reads one activation buffer and writes the other,
+and final RMSNorm writes to the unused buffer before LM-head projection. Thus
+both odd and even layer counts use the same ping-pong loop. It also owns a
+device token-ID buffer only for the optional host-token convenience wrapper and
+an array of reusable `DecoderBlockWorkspace` objects. Setup allocates these
+buffers once; successful core forwards allocate and free nothing.
 
 ## Incremental flow
 
