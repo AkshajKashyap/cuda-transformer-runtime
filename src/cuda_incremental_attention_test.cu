@@ -14,6 +14,66 @@ bool close(float a, float b) {
   return std::fabs(a - b) <= 4.0e-4F + 1.0e-4F * fmaxf(1.0F, std::fabs(b));
 }
 
+bool probability_value_paths_match(std::size_t history) {
+  constexpr std::size_t heads = 4;
+  constexpr std::size_t dim = 64;
+  const std::size_t probability_count = heads * history;
+  const std::size_t value_count = probability_count * dim;
+  std::vector<float> probabilities(probability_count), values(value_count),
+      expected(heads * dim), serial(heads * dim), parallel(heads * dim);
+  for (std::size_t h = 0; h < heads; ++h)
+    for (std::size_t k = 0; k < history; ++k) {
+      probabilities[h * history + k] =
+          static_cast<float>((h * 11 + k * 3) % 19 + 1) / (19.0F * history);
+      for (std::size_t d = 0; d < dim; ++d) {
+        const float value =
+            static_cast<float>(static_cast<int>((h * 13 + k * 5 + d) % 29) -
+                               14) /
+            29.0F;
+        values[(h * history + k) * dim + d] = value;
+        expected[h * dim + d] += probabilities[h * history + k] * value;
+      }
+    }
+  float *dp = nullptr, *dv = nullptr, *ds = nullptr, *dparallel = nullptr;
+  auto cleanup = [&](bool ok) {
+    for (float* pointer : {dp, dv, ds, dparallel})
+      if (pointer != nullptr && !CTR_CUDA_CHECK(cudaFree(pointer)))
+        ok = false;
+    return ok;
+  };
+  if (!CTR_CUDA_CHECK(cudaMalloc(&dp, probability_count * sizeof(float))) ||
+      !CTR_CUDA_CHECK(cudaMalloc(&dv, value_count * sizeof(float))) ||
+      !CTR_CUDA_CHECK(cudaMalloc(&ds, expected.size() * sizeof(float))) ||
+      !CTR_CUDA_CHECK(
+          cudaMalloc(&dparallel, expected.size() * sizeof(float))) ||
+      !CTR_CUDA_CHECK(cudaMemcpy(dp, probabilities.data(),
+                                 probability_count * sizeof(float),
+                                 cudaMemcpyHostToDevice)) ||
+      !CTR_CUDA_CHECK(cudaMemcpy(dv, values.data(), value_count * sizeof(float),
+                                 cudaMemcpyHostToDevice)) ||
+      !CTR_CUDA_CHECK(cuda_transformer::incremental_probability_value_serial_cuda(
+          dp, dv, ds, heads, history, history, dim)) ||
+      !CTR_CUDA_CHECK(cuda_transformer::incremental_probability_value_parallel_cuda(
+          dp, dv, dparallel, heads, history, history, dim)) ||
+      !CTR_CUDA_CHECK(cudaDeviceSynchronize()) ||
+      !CTR_CUDA_CHECK(cudaMemcpy(serial.data(), ds, expected.size() * sizeof(float),
+                                 cudaMemcpyDeviceToHost)) ||
+      !CTR_CUDA_CHECK(cudaMemcpy(parallel.data(), dparallel,
+                                 expected.size() * sizeof(float),
+                                 cudaMemcpyDeviceToHost)))
+    return cleanup(false);
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    if (!close(serial[i], expected[i]) || !close(parallel[i], expected[i])) {
+      std::fprintf(stderr,
+                   "P×V mismatch: history=%zu index=%zu serial=%.8g parallel=%.8g "
+                   "expected=%.8g\n",
+                   history, i, serial[i], parallel[i], expected[i]);
+      return cleanup(false);
+    }
+  }
+  return cleanup(true);
+}
+
 bool run_case(std::size_t heads, std::size_t sequence, std::size_t dim,
               std::size_t prefill) {
   cuda_transformer::AttentionShape shape{1, heads, sequence, dim};
@@ -254,6 +314,12 @@ int main() {
     if (!run_case(s[0], s[1], s[2], 0))
       return EXIT_FAILURE;
   if (!run_case(1, 7, 8, 3) || !run_case(4, 32, 64, 16))
+    return EXIT_FAILURE;
+  for (const std::size_t history : std::array<std::size_t, 3>{16, 257, 1024})
+    if (!probability_value_paths_match(history))
+      return EXIT_FAILURE;
+  if (!run_case(1, 258, 8, 257) || !run_case(1, 513, 8, 512) ||
+      !run_case(1, 1025, 8, 1024))
     return EXIT_FAILURE;
   std::puts("Incremental attention tests passed.");
 }

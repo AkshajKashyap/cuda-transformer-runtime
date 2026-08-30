@@ -212,6 +212,20 @@ path; it does not call `cudaMalloc` or `cudaFree` during a successful decode.
 The legacy `incremental_decode` convenience wrapper remains available and
 allocates temporary workspace for its single call.
 
+`cuda_incremental_pv_benchmark` compares the retained serial incremental P×V
+kernel with its cooperative-reduction implementation for heads=4, head_dim=64,
+and histories 16 through 2048. It excludes setup and transfers, uses 10 warmups
+and 9 CUDA-event batches, and reports median per-launch microseconds.
+
+```bash
+./build/src/cuda_incremental_pv_benchmark
+```
+
+The production incremental-attention path keeps the serial kernel below history
+512 and uses the cooperative P×V kernel at history 512 and above. This threshold
+is empirical for the RTX 3050 Laptop GPU and this benchmark shape, derived from
+the existing P×V microbenchmark; it is not a portability claim.
+
 ## Decoder-block decode benchmark
 
 `cuda_decoder_block_decode_benchmark` compares complete FP32 decoder-block

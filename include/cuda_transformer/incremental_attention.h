@@ -27,6 +27,18 @@ cudaError_t incremental_attention_workspace_create(
 cudaError_t incremental_attention_workspace_destroy(
     IncrementalAttentionWorkspace* workspace);
 
+// P×V helpers for the contiguous [heads, max_sequence, head_dim] V cache and
+// compact [heads, length] probability rows. The serial path is retained for
+// short histories; the parallel path cooperatively reduces one (head, dim).
+cudaError_t incremental_probability_value_serial_cuda(
+    const float* probabilities, const float* values, float* output,
+    std::size_t heads, std::size_t length, std::size_t max_sequence,
+    std::size_t head_dim, cudaStream_t stream = nullptr);
+cudaError_t incremental_probability_value_parallel_cuda(
+    const float* probabilities, const float* values, float* output,
+    std::size_t heads, std::size_t length, std::size_t max_sequence,
+    std::size_t head_dim, cudaStream_t stream = nullptr);
+
 // Performs one no-allocation cached decode. The workspace capacity must match
 // the supplied cache, and the function does not synchronize.
 cudaError_t incremental_decode_with_workspace(

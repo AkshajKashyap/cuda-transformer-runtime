@@ -9,6 +9,9 @@ namespace cuda_transformer {
 namespace {
 
 constexpr int kThreads = 256;
+constexpr int kParallelProbabilityValueThreads = 256;
+// Measured on the RTX 3050 Laptop GPU by cuda_incremental_pv_benchmark.
+constexpr std::size_t kParallelProbabilityValueThreshold = 512;
 
 __global__ void rotate(const float* input, float* output, std::size_t heads,
                        std::size_t head_dim, std::size_t position) {
@@ -45,11 +48,12 @@ __global__ void scores(const float* query, const float* keys, float* output,
   output[index] = sum / sqrtf(static_cast<float>(head_dim));
 }
 
-__global__ void probability_value(const float* probabilities, const float* values,
-                                  float* output, std::size_t heads,
-                                  std::size_t length,
-                                  std::size_t max_sequence,
-                                  std::size_t head_dim) {
+__global__ void probability_value_serial(const float* probabilities,
+                                         const float* values, float* output,
+                                         std::size_t heads,
+                                         std::size_t length,
+                                         std::size_t max_sequence,
+                                         std::size_t head_dim) {
   const std::size_t index =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (index >= heads * head_dim)
@@ -61,6 +65,34 @@ __global__ void probability_value(const float* probabilities, const float* value
     sum += probabilities[head * length + position] *
            values[(head * max_sequence + position) * head_dim + dimension];
   output[index] = sum;
+}
+
+__global__ void probability_value_parallel(const float* probabilities,
+                                           const float* values, float* output,
+                                           std::size_t length,
+                                           std::size_t max_sequence,
+                                           std::size_t head_dim) {
+  const std::size_t output_index = blockIdx.x;
+  const std::size_t head = output_index / head_dim;
+  const std::size_t dimension = output_index % head_dim;
+  float partial = 0.0F;
+  for (std::size_t position = threadIdx.x; position < length;
+       position += blockDim.x) {
+    partial += probabilities[head * length + position] *
+               values[(head * max_sequence + position) * head_dim + dimension];
+  }
+
+  __shared__ float sums[kParallelProbabilityValueThreads];
+  sums[threadIdx.x] = partial;
+  __syncthreads();
+  for (int stride = kParallelProbabilityValueThreads / 2; stride > 0;
+       stride /= 2) {
+    if (threadIdx.x < stride)
+      sums[threadIdx.x] += sums[threadIdx.x + stride];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0)
+    output[output_index] = sums[0];
 }
 
 bool multiply_fits(std::size_t left, std::size_t right) {
@@ -100,6 +132,18 @@ bool valid_cache(const KvCache* cache) {
          cache->values != nullptr && cache->heads != 0 &&
          cache->head_dim != 0 && cache->max_sequence != 0 &&
          cache->head_dim % 2 == 0 && cache->current_length < cache->max_sequence;
+}
+
+bool valid_probability_value_arguments(const float* probabilities,
+                                       const float* values, float* output,
+                                       std::size_t heads, std::size_t length,
+                                       std::size_t max_sequence,
+                                       std::size_t head_dim) {
+  return probabilities != nullptr && values != nullptr && output != nullptr &&
+         heads != 0 && length != 0 && max_sequence != 0 &&
+         head_dim != 0 && length <= max_sequence &&
+         multiply_fits(heads, head_dim) &&
+         multiply_fits(heads, max_sequence);
 }
 
 void clear(IncrementalAttentionWorkspace* workspace) {
@@ -156,6 +200,33 @@ cudaError_t incremental_attention_workspace_destroy(
   return error;
 }
 
+cudaError_t incremental_probability_value_serial_cuda(
+    const float* probabilities, const float* values, float* output,
+    std::size_t heads, std::size_t length, std::size_t max_sequence,
+    std::size_t head_dim, cudaStream_t stream) {
+  if (!valid_probability_value_arguments(probabilities, values, output, heads,
+                                         length, max_sequence, head_dim))
+    return cudaErrorInvalidValue;
+  const std::size_t output_count = heads * head_dim;
+  probability_value_serial<<<(output_count + kThreads - 1) / kThreads,
+                             kThreads, 0, stream>>>(
+      probabilities, values, output, heads, length, max_sequence, head_dim);
+  return cudaGetLastError();
+}
+
+cudaError_t incremental_probability_value_parallel_cuda(
+    const float* probabilities, const float* values, float* output,
+    std::size_t heads, std::size_t length, std::size_t max_sequence,
+    std::size_t head_dim, cudaStream_t stream) {
+  if (!valid_probability_value_arguments(probabilities, values, output, heads,
+                                         length, max_sequence, head_dim))
+    return cudaErrorInvalidValue;
+  probability_value_parallel<<<heads * head_dim,
+                               kParallelProbabilityValueThreads, 0, stream>>>(
+      probabilities, values, output, length, max_sequence, head_dim);
+  return cudaGetLastError();
+}
+
 cudaError_t incremental_decode_with_workspace(
     KvCache* cache, const float* q, const float* k, const float* v,
     float* output, IncrementalAttentionWorkspace* workspace,
@@ -189,11 +260,13 @@ cudaError_t incremental_decode_with_workspace(
     error = softmax_cuda(workspace->scores, workspace->scores, cache->heads,
                          length, stream);
   if (error == cudaSuccess) {
-    probability_value<<<(token_count + kThreads - 1) / kThreads, kThreads, 0,
-                        stream>>>(workspace->scores, cache->values, output,
-                                  cache->heads, length, cache->max_sequence,
-                                  cache->head_dim);
-    error = cudaGetLastError();
+    error = length < kParallelProbabilityValueThreshold
+                ? incremental_probability_value_serial_cuda(
+                      workspace->scores, cache->values, output, cache->heads,
+                      length, cache->max_sequence, cache->head_dim, stream)
+                : incremental_probability_value_parallel_cuda(
+                      workspace->scores, cache->values, output, cache->heads,
+                      length, cache->max_sequence, cache->head_dim, stream);
   }
   return error;
 }
