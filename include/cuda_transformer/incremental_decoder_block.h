@@ -1,6 +1,7 @@
 #pragma once
 
 #include "cuda_transformer/attention_sublayer.h"
+#include "cuda_transformer/incremental_attention.h"
 #include "cuda_transformer/kv_cache.h"
 #include "cuda_transformer/mlp_sublayer.h"
 #include "cuda_transformer/qkv_projection.h"
@@ -14,6 +15,9 @@ struct IncrementalDecoderBlockConfig {
   std::size_t intermediate = 0;
   float attention_rmsnorm_epsilon = 0.0F;
   float mlp_rmsnorm_epsilon = 0.0F;
+  // Scratch capacity for one-token attention. The external cache remains
+  // caller-owned and must have this same fixed capacity.
+  std::size_t max_sequence = 0;
 };
 
 // Caller-owned FP32 weights. The nested structures retain their established
@@ -23,10 +27,11 @@ struct IncrementalDecoderBlockWeights {
   MlpSublayerWeights mlp{};
 };
 
-// Reuses a one-token QKV projection workspace and owns only temporary token
-// activations. The KV cache is supplied separately by the caller.
+// Reuses one-token QKV and attention scratch plus temporary token activations.
+// The KV cache remains supplied separately by the caller.
 struct IncrementalDecoderBlockWorkspace {
   QkvProjectionWorkspace qkv;
+  IncrementalAttentionWorkspace attention;
   float* attention_normalized = nullptr;
   float* attention_head = nullptr;
   float* attention_token = nullptr;

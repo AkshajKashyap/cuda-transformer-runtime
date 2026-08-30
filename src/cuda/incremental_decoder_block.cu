@@ -32,7 +32,8 @@ bool configs_match(IncrementalDecoderBlockConfig left,
          left.head_dim == right.head_dim &&
          left.intermediate == right.intermediate &&
          left.attention_rmsnorm_epsilon == right.attention_rmsnorm_epsilon &&
-         left.mlp_rmsnorm_epsilon == right.mlp_rmsnorm_epsilon;
+         left.mlp_rmsnorm_epsilon == right.mlp_rmsnorm_epsilon &&
+         left.max_sequence == right.max_sequence;
 }
 
 bool workspace_is_empty(const IncrementalDecoderBlockWorkspace* workspace) {
@@ -40,6 +41,11 @@ bool workspace_is_empty(const IncrementalDecoderBlockWorkspace* workspace) {
          workspace->qkv.k_token == nullptr && workspace->qkv.v_token == nullptr &&
          workspace->qkv.q_head == nullptr && workspace->qkv.k_head == nullptr &&
          workspace->qkv.v_head == nullptr &&
+         workspace->attention.rotated_q == nullptr &&
+         workspace->attention.rotated_k == nullptr &&
+         workspace->attention.scores == nullptr &&
+         workspace->attention.heads == 0 && workspace->attention.head_dim == 0 &&
+         workspace->attention.max_sequence == 0 &&
          workspace->attention_normalized == nullptr &&
          workspace->attention_head == nullptr && workspace->attention_token == nullptr &&
          workspace->attention_projected == nullptr &&
@@ -68,6 +74,12 @@ bool workspace_matches(const IncrementalDecoderBlockWorkspace* workspace) {
          configs_match(workspace->config, workspace->allocation_config) &&
          qkv_matches(workspace->qkv, workspace->config) &&
          workspace->attention_normalized != nullptr &&
+         workspace->attention.rotated_q != nullptr &&
+         workspace->attention.rotated_k != nullptr &&
+         workspace->attention.scores != nullptr &&
+         workspace->attention.heads == workspace->config.heads &&
+         workspace->attention.head_dim == workspace->config.head_dim &&
+         workspace->attention.max_sequence == workspace->config.max_sequence &&
          workspace->attention_head != nullptr && workspace->attention_token != nullptr &&
          workspace->attention_projected != nullptr &&
          workspace->attention_residual != nullptr &&
@@ -80,6 +92,7 @@ bool cache_matches(const KvCache* cache, IncrementalDecoderBlockConfig config) {
   return cache != nullptr && cache->keys != nullptr && cache->values != nullptr &&
          cache->batch == 1 && cache->heads == config.heads &&
          cache->head_dim == config.head_dim && cache->max_sequence != 0 &&
+         cache->max_sequence == config.max_sequence &&
          cache->current_length < cache->max_sequence;
 }
 
@@ -99,6 +112,7 @@ cudaError_t first_error(cudaError_t first, cudaError_t next) {
 bool valid_incremental_decoder_block_config(IncrementalDecoderBlockConfig config) {
   return config.hidden != 0 && config.heads != 0 && config.head_dim != 0 &&
          config.intermediate != 0 && config.head_dim % 2 == 0 &&
+         config.max_sequence != 0 &&
          config.hidden % config.heads == 0 &&
          config.hidden / config.heads == config.head_dim &&
          std::isfinite(config.attention_rmsnorm_epsilon) &&
@@ -140,6 +154,9 @@ cudaError_t incremental_decoder_block_workspace_create(
     error = cudaMalloc(&workspace->gated, intermediate_bytes);
   if (error == cudaSuccess)
     error = cudaMalloc(&workspace->down, hidden_bytes);
+  if (error == cudaSuccess)
+    error = incremental_attention_workspace_create(
+        &workspace->attention, config.heads, config.head_dim, config.max_sequence);
   if (error != cudaSuccess)
     incremental_decoder_block_workspace_destroy(workspace);
   else {
@@ -165,6 +182,8 @@ cudaError_t incremental_decoder_block_workspace_destroy(
     if (pointer != nullptr)
       error = first_error(error, cudaFree(pointer));
   }
+  error = first_error(error,
+                      incremental_attention_workspace_destroy(&workspace->attention));
   error = first_error(error, qkv_projection_workspace_destroy(&workspace->qkv));
   clear(workspace);
   return error;
@@ -193,9 +212,10 @@ cublasStatus_t incremental_decoder_block_cuda(
       weights.attention.wk, weights.attention.wv, &workspace->qkv, stream);
   if (status != CUBLAS_STATUS_SUCCESS)
     return status;
-  cuda_error = incremental_decode(cache, workspace->qkv.q_head,
-                                  workspace->qkv.k_head, workspace->qkv.v_head,
-                                  workspace->attention_head, stream);
+  cuda_error = incremental_decode_with_workspace(
+      cache, workspace->qkv.q_head, workspace->qkv.k_head,
+      workspace->qkv.v_head, workspace->attention_head, &workspace->attention,
+      stream);
   if (cuda_error != cudaSuccess)
     return CUBLAS_STATUS_EXECUTION_FAILED;
   cuda_error = head_major_to_token_major_cuda(

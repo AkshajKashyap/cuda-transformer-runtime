@@ -203,6 +203,15 @@ latency is reported. Short-context measurements may be dominated by fixed launch
 overhead, so they need not be monotonic. Q·K and P×V work grows roughly linearly
 with valid history; measurements determine where that scaling becomes visible.
 
+Steady-state production decoder-block decode preallocates its incremental
+attention scratch with its workspace: rotated Q and K each contain
+`heads*head_dim` FP32 values, and the in-place score/probability buffer contains
+`heads*max_sequence`. The caller still owns the KV cache, whose fixed capacity
+must match the workspace. `incremental_decoder_block_cuda` uses this no-allocation
+path; it does not call `cudaMalloc` or `cudaFree` during a successful decode.
+The legacy `incremental_decode` convenience wrapper remains available and
+allocates temporary workspace for its single call.
+
 ## Decoder-block decode benchmark
 
 `cuda_decoder_block_decode_benchmark` compares complete FP32 decoder-block

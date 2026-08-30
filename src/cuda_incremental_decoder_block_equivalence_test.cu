@@ -131,6 +131,7 @@ bool run(cublasHandle_t handle, Shape shape) {
         *d_incremental_output = nullptr, *d_full_output = nullptr;
   KvCache cache;
   QkvProjectionWorkspace qkv;
+  IncrementalAttentionWorkspace attention_workspace;
   auto cleanup = [&](bool ok) {
     for (float* pointer : {d_full_input, d_token_input, d_attention_norm,
                            d_mlp_norm, d_wq, d_wk, d_wv, d_wo, d_w_gate, d_w_up,
@@ -143,6 +144,9 @@ bool run(cublasHandle_t handle, Shape shape) {
     }
     if (qkv.q_token != nullptr &&
         !CTR_CUDA_CHECK(qkv_projection_workspace_destroy(&qkv)))
+      ok = false;
+    if (!CTR_CUDA_CHECK(
+            incremental_attention_workspace_destroy(&attention_workspace)))
       ok = false;
     if (!CTR_CUDA_CHECK(kv_cache_destroy(&cache)))
       ok = false;
@@ -157,6 +161,8 @@ bool run(cublasHandle_t handle, Shape shape) {
                                       shape.head_dim)) ||
       !CTR_CUDA_CHECK(qkv_projection_workspace_create(
           &qkv, {1, shape.hidden, shape.heads, shape.head_dim})) ||
+      !CTR_CUDA_CHECK(incremental_attention_workspace_create(
+          &attention_workspace, shape.heads, shape.head_dim, shape.sequence)) ||
       !CTR_CUDA_CHECK(cudaMalloc(&d_full_input, activation_bytes)) ||
       !CTR_CUDA_CHECK(cudaMalloc(&d_token_input, hidden_bytes)) ||
       !CTR_CUDA_CHECK(cudaMalloc(&d_attention_norm, hidden_bytes)) ||
@@ -247,8 +253,9 @@ bool run(cublasHandle_t handle, Shape shape) {
       ok = CTR_CUBLAS_CHECK(project_qkv_cuda(handle, d_attention_residual, d_wq,
                                               d_wk, d_wv, &qkv));
     if (ok)
-      ok = CTR_CUDA_CHECK(incremental_decode(&cache, qkv.q_head, qkv.k_head,
-                                              qkv.v_head, d_attention_head));
+      ok = CTR_CUDA_CHECK(incremental_decode_with_workspace(
+          &cache, qkv.q_head, qkv.k_head, qkv.v_head, d_attention_head,
+          &attention_workspace));
     if (ok)
       ok = CTR_CUDA_CHECK(head_major_to_token_major_cuda(
           d_attention_head, d_attention_token, 1, shape.heads, shape.head_dim));

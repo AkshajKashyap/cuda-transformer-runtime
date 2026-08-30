@@ -143,7 +143,7 @@ bool run_history(cublasHandle_t handle, const DeviceWeights& device_weights,
       {sequence, kHidden, kIntermediate, kEpsilon},
   };
   const IncrementalDecoderBlockConfig incremental_config{
-      kHidden, kHeads, kHeadDim, kIntermediate, kEpsilon, kEpsilon,
+      kHidden, kHeads, kHeadDim, kIntermediate, kEpsilon, kEpsilon, sequence,
   };
   const DecoderBlockWeights full_weights{
       {device_weights.attention_norm, device_weights.wq, device_weights.wk,

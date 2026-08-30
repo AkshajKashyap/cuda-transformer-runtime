@@ -22,6 +22,7 @@ int launches(std::size_t history) {
 }
 bool run(Config c) {
   cuda_transformer::KvCache cache;
+  cuda_transformer::IncrementalAttentionWorkspace workspace;
   if (!CTR_CUDA_CHECK(cuda_transformer::kv_cache_create(&cache, 1, c.heads,
                                                         c.history + 1, c.dim)))
     return false;
@@ -34,6 +35,9 @@ bool run(Config c) {
     for (auto p : {dk, dv, dq, do_})
       if (p && !CTR_CUDA_CHECK(cudaFree(p)))
         ok = false;
+    if (!CTR_CUDA_CHECK(
+            cuda_transformer::incremental_attention_workspace_destroy(&workspace)))
+      ok = false;
     return CTR_CUDA_CHECK(cuda_transformer::kv_cache_destroy(&cache)) && ok;
   };
   if (!CTR_CUDA_CHECK(cudaMalloc(&dk, history_elements * sizeof(float))) ||
@@ -50,6 +54,9 @@ bool run(Config c) {
                                  token_elements * sizeof(float),
                                  cudaMemcpyHostToDevice)))
     return clean(false);
+  if (!CTR_CUDA_CHECK(cuda_transformer::incremental_attention_workspace_create(
+          &workspace, c.heads, c.dim, c.history + 1)))
+    return clean(false);
   if (!CTR_CUDA_CHECK(
           cuda_transformer::kv_cache_prefill(&cache, dk, dv, c.history)) ||
       !CTR_CUDA_CHECK(cudaDeviceSynchronize()))
@@ -59,7 +66,8 @@ bool run(Config c) {
   for (int i = 0; i < warmups; i++) {
     cache.current_length = c.history;
     if (!CTR_CUDA_CHECK(
-            cuda_transformer::incremental_decode(&cache, dq, dq, dq, do_)))
+            cuda_transformer::incremental_decode_with_workspace(
+                &cache, dq, dq, dq, do_, &workspace)))
       return clean(false);
   }
   if (!CTR_CUDA_CHECK(cudaDeviceSynchronize()))
@@ -75,7 +83,8 @@ bool run(Config c) {
     for (int i = 0; i < count; i++) {
       cache.current_length = c.history;
       if (!CTR_CUDA_CHECK(
-              cuda_transformer::incremental_decode(&cache, dq, dq, dq, do_)))
+              cuda_transformer::incremental_decode_with_workspace(
+                  &cache, dq, dq, dq, do_, &workspace)))
         return clean(false);
     }
     if (!CTR_CUDA_CHECK(cudaEventRecord(b)) ||

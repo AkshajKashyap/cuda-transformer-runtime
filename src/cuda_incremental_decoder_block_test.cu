@@ -56,9 +56,10 @@ bool invalid_config_tests() {
   using cuda_transformer::incremental_decoder_block_workspace_create;
   using cuda_transformer::valid_incremental_decoder_block_config;
 
-  const IncrementalDecoderBlockConfig valid{8, 1, 8, 16, kEpsilon, kEpsilon};
-  auto invalid = std::array<IncrementalDecoderBlockConfig, 9>{
-      valid, valid, valid, valid, valid, valid, valid, valid, valid};
+  const IncrementalDecoderBlockConfig valid{8, 1, 8, 16, kEpsilon, kEpsilon,
+                                            1};
+  auto invalid = std::array<IncrementalDecoderBlockConfig, 10>{
+      valid, valid, valid, valid, valid, valid, valid, valid, valid, valid};
   invalid[0].hidden = 0;
   invalid[1].heads = 0;
   invalid[2].head_dim = 7;
@@ -68,6 +69,7 @@ bool invalid_config_tests() {
   invalid[6].mlp_rmsnorm_epsilon = -kEpsilon;
   invalid[7].mlp_rmsnorm_epsilon = std::numeric_limits<float>::infinity();
   invalid[8].attention_rmsnorm_epsilon = std::numeric_limits<float>::infinity();
+  invalid[9].max_sequence = 0;
   for (const IncrementalDecoderBlockConfig config : invalid) {
     IncrementalDecoderBlockWorkspace workspace;
     if (valid_incremental_decoder_block_config(config) ||
@@ -85,7 +87,7 @@ bool run(cublasHandle_t handle, Shape shape) {
 
   const IncrementalDecoderBlockConfig incremental_config{
       shape.hidden, shape.heads, shape.head_dim, shape.intermediate, kEpsilon,
-      kEpsilon};
+      kEpsilon, shape.sequence};
   const std::size_t activation_count = shape.sequence * shape.hidden;
   const std::size_t square_weight_count = shape.hidden * shape.hidden;
   const std::size_t gate_weight_count = shape.hidden * shape.intermediate;
@@ -227,6 +229,13 @@ bool run(cublasHandle_t handle, Shape shape) {
                                              d_incremental_output) ==
                  CUBLAS_STATUS_INVALID_VALUE;
   workspace.config = saved_workspace_config;
+  ++workspace.attention.max_sequence;
+  ok = ok && incremental_decoder_block_cuda(handle, d_token_input,
+                                             incremental_weights, &cache,
+                                             &workspace,
+                                             d_incremental_output) ==
+                 CUBLAS_STATUS_INVALID_VALUE;
+  --workspace.attention.max_sequence;
   const std::size_t saved_heads = cache.heads;
   ++cache.heads;
   ok = ok && incremental_decoder_block_cuda(handle, d_token_input,
@@ -235,6 +244,14 @@ bool run(cublasHandle_t handle, Shape shape) {
                                              d_incremental_output) ==
                  CUBLAS_STATUS_INVALID_VALUE;
   cache.heads = saved_heads;
+  const std::size_t saved_max_sequence = cache.max_sequence;
+  ++cache.max_sequence;
+  ok = ok && incremental_decoder_block_cuda(handle, d_token_input,
+                                             incremental_weights, &cache,
+                                             &workspace,
+                                             d_incremental_output) ==
+                 CUBLAS_STATUS_INVALID_VALUE;
+  cache.max_sequence = saved_max_sequence;
 
   std::vector<float> incremental_output(shape.hidden), full_output(shape.hidden);
   for (std::size_t token = 0; token < shape.sequence && ok; ++token) {

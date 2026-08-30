@@ -242,10 +242,10 @@ bool compose_incremental(
           workspace->qkv.v_token, workspace->qkv.v_head, 1, config.heads,
           config.head_dim)) ||
       !record(boundaries, kIncrementalAttention) ||
-      !CTR_CUDA_CHECK(incremental_decode(cache, workspace->qkv.q_head,
-                                         workspace->qkv.k_head,
-                                         workspace->qkv.v_head,
-                                         workspace->attention_head)) ||
+      !CTR_CUDA_CHECK(incremental_decode_with_workspace(
+          cache, workspace->qkv.q_head, workspace->qkv.k_head,
+          workspace->qkv.v_head, workspace->attention_head,
+          &workspace->attention)) ||
       !record(boundaries, kAttentionOutputLayout) ||
       !CTR_CUDA_CHECK(head_major_to_token_major_cuda(
           workspace->attention_head, workspace->attention_token, 1, config.heads,
@@ -430,7 +430,7 @@ bool run_history(cublasHandle_t handle, const DeviceWeights& device_weights,
 
   const std::size_t sequence = profile_config.history + 1;
   const IncrementalDecoderBlockConfig config{
-      kHidden, kHeads, kHeadDim, kIntermediate, kEpsilon, kEpsilon,
+      kHidden, kHeads, kHeadDim, kIntermediate, kEpsilon, kEpsilon, sequence,
   };
   const IncrementalDecoderBlockWeights weights{
       {device_weights.attention_norm, device_weights.wq, device_weights.wk,
@@ -530,7 +530,7 @@ bool run_trace(cublasHandle_t handle, const DeviceWeights& device_weights,
   }
   const std::size_t sequence = options.history + 1;
   const IncrementalDecoderBlockConfig config{
-      kHidden, kHeads, kHeadDim, kIntermediate, kEpsilon, kEpsilon,
+      kHidden, kHeads, kHeadDim, kIntermediate, kEpsilon, kEpsilon, sequence,
   };
   const IncrementalDecoderBlockWeights weights{
       {device_weights.attention_norm, device_weights.wq, device_weights.wk,

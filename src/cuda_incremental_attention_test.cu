@@ -29,6 +29,10 @@ bool run_case(std::size_t heads, std::size_t sequence, std::size_t dim,
                                   rotated_q.data(), probabilities.data(),
                                   reference.data(), shape);
   cuda_transformer::KvCache cache;
+  cuda_transformer::IncrementalAttentionWorkspace workspace;
+  cuda_transformer::IncrementalAttentionWorkspace wrong_heads_workspace;
+  cuda_transformer::IncrementalAttentionWorkspace wrong_dim_workspace;
+  cuda_transformer::IncrementalAttentionWorkspace wrong_capacity_workspace;
   if (!CTR_CUDA_CHECK(
           cuda_transformer::kv_cache_create(&cache, 1, heads, sequence, dim)))
     return false;
@@ -38,6 +42,12 @@ bool run_case(std::size_t heads, std::size_t sequence, std::size_t dim,
     for (auto p : {dq, dk, dv, do_, dfull, drot})
       if (p && !CTR_CUDA_CHECK(cudaFree(p)))
         ok = false;
+    for (auto* candidate : {&workspace, &wrong_heads_workspace,
+                            &wrong_dim_workspace,
+                            &wrong_capacity_workspace})
+      if (!CTR_CUDA_CHECK(
+              cuda_transformer::incremental_attention_workspace_destroy(candidate)))
+        ok = false;
     return CTR_CUDA_CHECK(cuda_transformer::kv_cache_destroy(&cache)) && ok;
   };
   const std::size_t token_bytes = heads * dim * sizeof(float);
@@ -46,6 +56,39 @@ bool run_case(std::size_t heads, std::size_t sequence, std::size_t dim,
       !CTR_CUDA_CHECK(cudaMalloc(&dv, token_bytes)) ||
       !CTR_CUDA_CHECK(cudaMalloc(&do_, token_bytes)))
     return clean(false);
+  if (!CTR_CUDA_CHECK(cuda_transformer::incremental_attention_workspace_create(
+          &workspace, heads, dim, sequence)) ||
+      !CTR_CUDA_CHECK(cuda_transformer::incremental_attention_workspace_create(
+          &wrong_heads_workspace, heads + 1, dim, sequence)) ||
+      !CTR_CUDA_CHECK(cuda_transformer::incremental_attention_workspace_create(
+          &wrong_dim_workspace, heads, dim + 2, sequence)) ||
+      !CTR_CUDA_CHECK(cuda_transformer::incremental_attention_workspace_create(
+          &wrong_capacity_workspace, heads, dim, sequence + 1)))
+    return clean(false);
+  if (cuda_transformer::incremental_decode_with_workspace(
+          &cache, dq, dk, dv, do_, nullptr) != cudaErrorInvalidValue ||
+      cuda_transformer::incremental_decode_with_workspace(
+          &cache, dq, dk, dv, do_, &wrong_heads_workspace) !=
+          cudaErrorInvalidValue ||
+      cuda_transformer::incremental_decode_with_workspace(
+          &cache, dq, dk, dv, do_, &wrong_dim_workspace) !=
+          cudaErrorInvalidValue ||
+      cuda_transformer::incremental_decode_with_workspace(
+          &cache, dq, dk, dv, do_, &wrong_capacity_workspace) !=
+          cudaErrorInvalidValue) {
+    std::fprintf(stderr, "incompatible incremental-attention workspace accepted\n");
+    return clean(false);
+  }
+  const std::size_t saved_max_sequence = workspace.max_sequence;
+  ++workspace.max_sequence;
+  const bool mutated_workspace_rejected =
+      cuda_transformer::incremental_decode_with_workspace(
+          &cache, dq, dk, dv, do_, &workspace) == cudaErrorInvalidValue;
+  workspace.max_sequence = saved_max_sequence;
+  if (!mutated_workspace_rejected) {
+    std::fprintf(stderr, "mutated incremental-attention workspace accepted\n");
+    return clean(false);
+  }
   bool ok = true;
   if (prefill) {
     if (!CTR_CUDA_CHECK(cudaMalloc(&dfull, elements * sizeof(float))) ||
@@ -118,7 +161,8 @@ bool run_case(std::size_t heads, std::size_t sequence, std::size_t dim,
          CTR_CUDA_CHECK(
              cudaMemcpy(dv, tv.data(), token_bytes, cudaMemcpyHostToDevice)) &&
          CTR_CUDA_CHECK(
-             cuda_transformer::incremental_decode(&cache, dq, dk, dv, do_)) &&
+             cuda_transformer::incremental_decode_with_workspace(
+                 &cache, dq, dk, dv, do_, &workspace)) &&
          CTR_CUDA_CHECK(cudaDeviceSynchronize()) &&
          CTR_CUDA_CHECK(cudaMemcpy(output.data(), do_, token_bytes,
                                    cudaMemcpyDeviceToHost));
@@ -184,13 +228,24 @@ bool run_case(std::size_t heads, std::size_t sequence, std::size_t dim,
       }
   }
   if (cache.current_length == sequence &&
-      cuda_transformer::incremental_decode(&cache, dq, dk, dv, do_) !=
+      cuda_transformer::incremental_decode_with_workspace(
+          &cache, dq, dk, dv, do_, &workspace) !=
           cudaErrorInvalidValue)
     ok = false;
   return clean(ok);
 }
 } // namespace
 int main() {
+  cuda_transformer::IncrementalAttentionWorkspace invalid_workspace;
+  if (cuda_transformer::incremental_attention_workspace_create(
+          &invalid_workspace, 0, 8, 4) != cudaErrorInvalidValue ||
+      cuda_transformer::incremental_attention_workspace_create(
+          &invalid_workspace, 1, 7, 4) != cudaErrorInvalidValue ||
+      cuda_transformer::incremental_attention_workspace_create(
+          &invalid_workspace, 1, 8, 0) != cudaErrorInvalidValue) {
+    std::fputs("invalid incremental-attention workspace accepted\n", stderr);
+    return EXIT_FAILURE;
+  }
   for (auto s : std::array<std::array<size_t, 3>, 5>{{{{1, 1, 2}},
                                                       {{1, 4, 4}},
                                                       {{2, 5, 8}},
