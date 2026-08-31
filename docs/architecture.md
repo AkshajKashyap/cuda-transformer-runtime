@@ -133,6 +133,32 @@ even/odd pairing, and base 10000. Both implementations use RMSNorm epsilon
 `1e-5`. Grouped-query/multi-query checkpoints are deliberately rejected until
 the attention and cache layouts represent `n_kv_heads < n_heads` correctly.
 
+## Legacy llama2.c tokenizer and text generation
+
+`Llama2Tokenizer` is deliberately CPU-side. It owns legacy tokenizer pieces,
+their BPE scores, and a byte-safe lookup map. The file begins with one native
+little-endian 32-bit maximum token length, followed by exactly the vocabulary
+count supplied by the matching checkpoint: a float score, 32-bit byte length,
+and raw bytes per piece. It has no self-describing vocabulary size. The loader
+validates bounds, truncation, trailing bytes, finite scores, and the required
+single-space dummy token.
+
+Encoding mirrors `run.c`: optional BOS `1`; a dummy token whose bytes are
+exactly `" "` only for non-empty input; codepoint-level UTF-8 lookup; fallback
+to each raw byte plus token offset `3`; then repeated best-score neighboring
+pair merges. The strict `>` score comparison retains the leftmost pair on an
+exact tie. EOS `2` is appended only when requested. Decode removes a leading
+ASCII space after BOS and maps exact `<0xXX>` vocabulary pieces to raw bytes;
+terminal safety filtering is not part of tokenizer decoding.
+
+The `cuda_llama2_generate` CLI composes this tokenizer with loaded checkpoint
+weights and `tiny_model_generate_greedy_cuda`; it does not duplicate decoder or
+generation math. It renders prompt plus continuation. To match authoritative
+llama2.c non-chat `generate()`, it passes stop token `1` to the existing greedy
+helper: the delimiter is returned but not decoded or printed. Token `2` remains
+EOS and is only suppressed from presentation, not used as this CLI's stopping
+condition. This convention must not be generalized to other Llama runtimes.
+
 ## Incremental flow
 
 `incremental_decoder_block_cuda` accepts one `[1, hidden]` token plus an

@@ -163,13 +163,17 @@ bool tiny_model_greedy_argmax_host(const float* host_logits,
 //
 // The final returned generated ID is not decoded: it has no successor logits
 // to produce. Therefore, on success each layer's cache length is
-// prompt_length + max_new_tokens - 1. A zero-token request succeeds without
-// resetting or otherwise mutating the workspace.
+// prompt_length + generated_token_count - 1 when at least one ID is returned.
+// A zero-token request succeeds without resetting or otherwise mutating the
+// workspace. `stop_token_id` is optional; when nonnegative, it is returned
+// then ends generation before any later token is decoded.
+// `generated_token_count` receives the actual number returned.
 cublasStatus_t tiny_model_generate_greedy_cuda(
     cublasHandle_t handle, const int* host_prompt_token_ids,
     std::size_t prompt_length, TinyModelWeights device_weights,
     TinyModelIncrementalWorkspace* workspace, std::size_t max_new_tokens,
     int* host_generated_token_ids, float* device_logits,
-    cudaStream_t stream = nullptr);
+    cudaStream_t stream = nullptr, int stop_token_id = -1,
+    std::size_t* generated_token_count = nullptr);
 
 }  // namespace cuda_transformer

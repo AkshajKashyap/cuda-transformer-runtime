@@ -56,6 +56,27 @@ curl -L https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.bin \
 FP32 header used by this file, not the newer versioned or quantized llama2.c
 formats.
 
+### Optional standard tokenizer and text generation
+
+The matching legacy 32k tokenizer is also local-only. The tokenizer file has
+no vocabulary-size field, so the loader receives and verifies the vocabulary
+size from the loaded checkpoint.
+
+```bash
+curl -L https://github.com/karpathy/llama2.c/raw/master/tokenizer.bin \
+  -o models/tokenizer.bin
+./build/src/cuda_llama2_tokenizer_integration models/tokenizer.bin
+./build/src/cuda_llama2_generate models/stories15M.bin models/tokenizer.bin \
+  "Once upon a time" 64
+```
+
+The generation CLI prints the original prompt plus continuation and the
+generated token IDs. It follows the authoritative llama2.c **non-chat** loop:
+a generated BOS token (`1`) is the sequence delimiter. This is intentionally
+scoped to the target reference behavior; EOS remains token `2` and is not a
+universal stopping convention. BOS/EOS marker strings are omitted from the
+user-facing rendered continuation.
+
 Run selected benchmarks after a successful build:
 
 ```bash
@@ -141,6 +162,23 @@ Only equal query/KV head counts are currently supported: checkpoints with
 `n_kv_heads != n_heads` are rejected rather than treated as grouped-query
 attention. The runtime and legacy reference both use even/odd RoPE pairs with
 base 10000 and RMSNorm epsilon `1e-5`.
+
+### Legacy llama2.c tokenizer
+
+`Llama2Tokenizer` is a CPU-only RAII loader for the standard legacy binary:
+one native little-endian `uint32` maximum token length, then a caller-supplied
+number of entries, each `float32` score, `uint32` byte length, and exact raw
+bytes. It rejects truncation, invalid sizes/scores, missing dummy-space token,
+and trailing bytes.
+
+Encoding matches `llama2.c`: optional BOS `1`, optional EOS `2`, a dummy token
+whose bytes are exactly one ASCII space for non-empty input, codepoint lookup,
+byte fallback `byte + 3`, then repeated highest-score adjacent BPE merging.
+Exact score ties keep the leftmost candidate. Decode removes one leading ASCII
+space after BOS and turns exact `<0xXX>` pieces back into raw bytes. The
+standard tokenizer integration checks the authoritative reference prompt
+`I believe the meaning of life is` against IDs
+`[1, 306, 4658, 278, 6593, 310, 2834, 338]`.
 
 ### Tiny model-level incremental decode
 
@@ -322,9 +360,10 @@ command-line override.
 ## Limitations
 
 - FP32 only; no FP16/BF16, Tensor Core, or quantized path.
-- No pretrained checkpoint loader or real pretrained-model inference.
-- No tokenizer, probabilistic sampling, or pretrained-model generation workflow;
-  the real checkpoint path accepts integer token IDs only.
+- Legacy FP32 stories15M checkpoint loading, 32k llama2.c tokenizer-compatible
+  text encoding/decoding, and CUDA greedy text generation are supported.
+- No tokenizer variants beyond the legacy llama2.c binary, no probabilistic
+  sampling, and no general pretrained-model compatibility layer.
 - Model-level prefill is sequential and correctness-first, not optimized.
 - Only legacy FP32 llama2.c checkpoints with equal query/KV head counts are
   supported; no newer versioned/quantized formats or grouped-query attention.

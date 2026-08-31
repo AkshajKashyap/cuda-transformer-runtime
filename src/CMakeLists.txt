@@ -72,6 +72,24 @@ target_include_directories(cuda_llama2_checkpoint
     PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(cuda_llama2_checkpoint PUBLIC cuda_tiny_model)
 
+add_library(cuda_llama2_tokenizer STATIC cpu/llama2_tokenizer.cpp)
+target_include_directories(cuda_llama2_tokenizer
+    PUBLIC ${PROJECT_SOURCE_DIR}/include)
+target_compile_features(cuda_llama2_tokenizer PUBLIC cxx_std_20)
+
+add_executable(cuda_llama2_tokenizer_test llama2_tokenizer_test.cpp)
+target_link_libraries(cuda_llama2_tokenizer_test PRIVATE cuda_llama2_tokenizer)
+add_test(NAME cuda_llama2_tokenizer_test COMMAND cuda_llama2_tokenizer_test)
+
+# Opt-in only: validates the external standard 32k tokenizer against the
+# authoritative llama2.c prompt/token sequence.
+add_executable(cuda_llama2_tokenizer_integration llama2_tokenizer_integration.cpp)
+target_link_libraries(cuda_llama2_tokenizer_integration PRIVATE cuda_llama2_tokenizer)
+
+add_executable(cuda_llama2_generate cuda_llama2_generate.cu)
+target_link_libraries(cuda_llama2_generate
+    PRIVATE cuda_llama2_checkpoint cuda_llama2_tokenizer)
+
 add_library(cuda_incremental_decoder_block STATIC cuda/incremental_decoder_block.cu)
 target_include_directories(cuda_incremental_decoder_block
     PUBLIC ${PROJECT_SOURCE_DIR}/include)

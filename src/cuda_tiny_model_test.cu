@@ -754,6 +754,17 @@ bool generation_test(cublasHandle_t handle, std::size_t layers,
                  &generated_workspace, max_new_tokens + 1, generated.data(),
                  device_generated_logits) == CUBLAS_STATUS_INVALID_VALUE &&
        cache_lengths_are(generated_workspace, expected_cache_length);
+
+  // The optional stop token is returned but is not decoded, matching the
+  // llama2.c-compatible non-chat driver's BOS-delimiter semantics.
+  std::vector<int> stopped(max_new_tokens);
+  std::size_t stopped_count = 0;
+  ok = ok && CTR_CUBLAS_CHECK(tiny_model_generate_greedy_cuda(
+                 handle, prompt.data(), prompt.size(), device_weights.view,
+                 &generated_workspace, max_new_tokens, stopped.data(),
+                 device_generated_logits, nullptr, generated[0], &stopped_count)) &&
+       stopped_count == 1 && stopped[0] == generated[0] &&
+       cache_lengths_are(generated_workspace, prompt.size());
   return cleanup() && ok;
 }
 

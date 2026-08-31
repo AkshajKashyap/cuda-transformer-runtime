@@ -10,13 +10,21 @@
 
 namespace {
 
-bool close_logits(const std::vector<float>& cpu, const std::vector<float>& gpu) {
+bool close_logits(const std::vector<float>& cpu, const std::vector<float>& gpu,
+                  std::size_t vocabulary_size, float* max_error,
+                  std::size_t* max_error_index) {
   if (cpu.size() != gpu.size())
     return false;
+  *max_error = 0.0F;
+  *max_error_index = 0;
   for (std::size_t index = 0; index < cpu.size(); ++index) {
     const float tolerance = 1e-3F + 2e-4F * fmaxf(1.0F, std::fabs(cpu[index]));
-    if (!std::isfinite(cpu[index]) || !std::isfinite(gpu[index]) ||
-        std::fabs(cpu[index] - gpu[index]) > tolerance) {
+    const float error = std::fabs(cpu[index] - gpu[index]);
+    if (error > *max_error) {
+      *max_error = error;
+      *max_error_index = index;
+    }
+    if (!std::isfinite(cpu[index]) || !std::isfinite(gpu[index]) || error > tolerance) {
       std::fprintf(stderr,
                    "real-checkpoint logits mismatch at %zu: cpu=%.8g gpu=%.8g "
                    "tolerance=%.8g\n",
@@ -24,6 +32,9 @@ bool close_logits(const std::vector<float>& cpu, const std::vector<float>& gpu) 
       return false;
     }
   }
+  std::printf("maximum CPU-vs-CUDA logit error: %.8g at flat index %zu "
+              "(token ID %zu)\n",
+              *max_error, *max_error_index, *max_error_index % vocabulary_size);
   return true;
 }
 
@@ -93,6 +104,8 @@ int main(int argc, char** argv) {
     return EXIT_FAILURE;
   }
   std::vector<float> gpu_logits(cpu_logits.size());
+  float max_error = 0.0F;
+  std::size_t max_error_index = 0;
   const bool ok = CTR_CUBLAS_CHECK(
                       cuda_transformer::tiny_model_forward_host_tokens_cuda(
                           handle, tokens.data(), model.device_weights, &workspace,
@@ -101,7 +114,8 @@ int main(int argc, char** argv) {
                   CTR_CUDA_CHECK(cudaMemcpy(gpu_logits.data(), device_logits,
                                             gpu_logits.size() * sizeof(float),
                                             cudaMemcpyDeviceToHost)) &&
-                  close_logits(cpu_logits, gpu_logits);
+                  close_logits(cpu_logits, gpu_logits, config.vocabulary_size,
+                               &max_error, &max_error_index);
   if (ok)
     std::puts("CPU and CUDA logits agree for the supplied integer-token sequence.");
   return cleanup() && ok ? EXIT_SUCCESS : EXIT_FAILURE;

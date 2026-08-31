@@ -690,17 +690,24 @@ cublasStatus_t tiny_model_generate_greedy_cuda(
     cublasHandle_t handle, const int* host_prompt_token_ids,
     std::size_t prompt_length, TinyModelWeights device_weights,
     TinyModelIncrementalWorkspace* workspace, std::size_t max_new_tokens,
-    int* host_generated_token_ids, float* device_logits, cudaStream_t stream) {
+    int* host_generated_token_ids, float* device_logits, cudaStream_t stream,
+    int stop_token_id, std::size_t* generated_token_count) {
   if (handle == nullptr ||
       !generation_preflight(host_prompt_token_ids, prompt_length,
                             device_weights, workspace, max_new_tokens,
-                            host_generated_token_ids, device_logits))
+                            host_generated_token_ids, device_logits) ||
+      (stop_token_id < -1 ||
+       (stop_token_id >= 0 &&
+        !valid_token_id(stop_token_id, workspace->model_config))))
     return CUBLAS_STATUS_INVALID_VALUE;
 
   // A zero-token request is intentionally a no-op: it does not discard a
   // caller's existing cache history or require output storage.
-  if (max_new_tokens == 0)
+  if (max_new_tokens == 0) {
+    if (generated_token_count != nullptr)
+      *generated_token_count = 0;
     return CUBLAS_STATUS_SUCCESS;
+  }
 
   cudaError_t cuda_error = tiny_model_incremental_workspace_reset(workspace);
   if (cuda_error != cudaSuccess)
@@ -721,6 +728,7 @@ cublasStatus_t tiny_model_generate_greedy_cuda(
   if (cuda_error != cudaSuccess || cudaStreamSynchronize(stream) != cudaSuccess)
     return CUBLAS_STATUS_EXECUTION_FAILED;
 
+  std::size_t generated_count = 0;
   for (std::size_t generated = 0; generated < max_new_tokens; ++generated) {
     int next_token = -1;
     if (!tiny_model_greedy_argmax_host(host_logits.data(), host_logits.size(),
@@ -730,7 +738,8 @@ cublasStatus_t tiny_model_generate_greedy_cuda(
 
     // The final selected token has no successor to score, so deliberately do
     // not decode it or consume an unnecessary cache position.
-    if (generated + 1 == max_new_tokens)
+    generated_count = generated + 1;
+    if (next_token == stop_token_id || generated_count == max_new_tokens)
       break;
     const cublasStatus_t status = tiny_model_incremental_decode_host_token_cuda(
         handle, next_token, device_weights, workspace, device_logits, stream);
@@ -742,6 +751,8 @@ cublasStatus_t tiny_model_generate_greedy_cuda(
     if (cuda_error != cudaSuccess || cudaStreamSynchronize(stream) != cudaSuccess)
       return CUBLAS_STATUS_EXECUTION_FAILED;
   }
+  if (generated_token_count != nullptr)
+    *generated_token_count = generated_count;
   return CUBLAS_STATUS_SUCCESS;
 }
 
