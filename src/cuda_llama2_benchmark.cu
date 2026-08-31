@@ -37,6 +37,8 @@ struct Options {
   bool trace = false;
   std::size_t trace_context = 0;
   int trace_iterations = 0;
+  bool graph_decode = false;
+  std::size_t graph_context = 0;
 };
 
 struct Stats {
@@ -77,8 +79,9 @@ void print_usage(const char* program) {
       "Usage:\n"
       "  %s checkpoint.bin tokenizer.bin\n"
       "  %s checkpoint.bin tokenizer.bin --trace-decode-context <N> "
-      "--trace-iterations <N>\n",
-      program, program);
+      "--trace-iterations <N>\n"
+      "  %s checkpoint.bin tokenizer.bin --graph-decode-context <N>\n",
+      program, program, program);
 }
 
 bool parse_options(int argc, char** argv, Options* options) {
@@ -91,6 +94,7 @@ bool parse_options(int argc, char** argv, Options* options) {
 
   bool saw_context = false;
   bool saw_iterations = false;
+  bool saw_graph_context = false;
   for (int index = 3; index < argc; ++index) {
     if (std::strcmp(argv[index], "--trace-decode-context") == 0 &&
         !saw_context && index + 1 < argc &&
@@ -104,7 +108,17 @@ bool parse_options(int argc, char** argv, Options* options) {
       saw_iterations = true;
       continue;
     }
+    if (std::strcmp(argv[index], "--graph-decode-context") == 0 &&
+        !saw_graph_context && index + 1 < argc &&
+        parse_positive_size(argv[++index], &options->graph_context)) {
+      saw_graph_context = true;
+      continue;
+    }
     return false;
+  }
+  if (saw_graph_context && !saw_context && !saw_iterations) {
+    options->graph_decode = true;
+    return true;
   }
   options->trace = saw_context && saw_iterations;
   return options->trace;
@@ -140,12 +154,12 @@ bool prefill_history(cublasHandle_t handle, const int* device_tokens,
                      std::size_t length,
                      cuda_transformer::TinyModelWeights device_weights,
                      cuda_transformer::TinyModelIncrementalWorkspace* workspace,
-                     float* device_logits) {
+                     float* device_logits, cudaStream_t stream = nullptr) {
   using namespace cuda_transformer;
   return CTR_CUDA_CHECK(tiny_model_incremental_workspace_reset(workspace)) &&
          CTR_CUBLAS_CHECK(tiny_model_incremental_prefill_cuda(
              handle, device_tokens, length, device_weights, workspace,
-             device_logits));
+             device_logits, stream));
 }
 
 // Each launch has its own event pair. Host-only logical-cache restoration is
@@ -153,14 +167,15 @@ bool prefill_history(cublasHandle_t handle, const int* device_tokens,
 // single large event interval.
 bool measure_gpu_batches(const std::function<bool()>& prepare,
                          const std::function<bool()>& launch,
-                         int launches_per_batch, Stats* stats) {
+                         int launches_per_batch, Stats* stats,
+                         cudaStream_t stream = nullptr) {
   if (launches_per_batch <= 0 || stats == nullptr)
     return false;
   for (int warmup = 0; warmup < kWarmups; ++warmup) {
     if (!prepare() || !launch())
       return false;
   }
-  if (!CTR_CUDA_CHECK(cudaDeviceSynchronize()))
+  if (!CTR_CUDA_CHECK(cudaStreamSynchronize(stream)))
     return false;
 
   std::vector<cudaEvent_t> starts(static_cast<std::size_t>(launches_per_batch),
@@ -181,8 +196,9 @@ bool measure_gpu_batches(const std::function<bool()>& prepare,
     float batch_ms = 0.0F;
     for (int launch_index = 0; launch_index < launches_per_batch && ok;
          ++launch_index) {
-      ok = prepare() && CTR_CUDA_CHECK(cudaEventRecord(starts[launch_index])) &&
-           launch() && CTR_CUDA_CHECK(cudaEventRecord(stops[launch_index]));
+      ok = prepare() &&
+           CTR_CUDA_CHECK(cudaEventRecord(starts[launch_index], stream)) &&
+           launch() && CTR_CUDA_CHECK(cudaEventRecord(stops[launch_index], stream));
     }
     if (ok)
       ok = CTR_CUDA_CHECK(
@@ -215,12 +231,13 @@ bool measure_gpu_batches(const std::function<bool()>& prepare,
 // `prepare` remains outside the clock so logical cache reset is not presented
 // as model prefill latency.
 bool measure_wall_batches(const std::function<bool()>& prepare,
-                          const std::function<bool()>& launch, Stats* stats) {
+                          const std::function<bool()>& launch, Stats* stats,
+                          cudaStream_t stream = nullptr) {
   using Clock = std::chrono::steady_clock;
   if (stats == nullptr)
     return false;
   for (int warmup = 0; warmup < kWarmups; ++warmup) {
-    if (!prepare() || !launch() || !CTR_CUDA_CHECK(cudaStreamSynchronize(nullptr)))
+    if (!prepare() || !launch() || !CTR_CUDA_CHECK(cudaStreamSynchronize(stream)))
       return false;
   }
   std::vector<float> samples;
@@ -229,7 +246,7 @@ bool measure_wall_batches(const std::function<bool()>& prepare,
     if (!prepare())
       return false;
     const auto start = Clock::now();
-    if (!launch() || !CTR_CUDA_CHECK(cudaStreamSynchronize(nullptr)))
+    if (!launch() || !CTR_CUDA_CHECK(cudaStreamSynchronize(stream)))
       return false;
     const auto stop = Clock::now();
     samples.push_back(
@@ -408,6 +425,255 @@ bool trace_decode(cublasHandle_t handle, const int* device_tokens,
   return ok;
 }
 
+struct CacheSnapshot {
+  std::vector<std::vector<float>> keys;
+  std::vector<std::vector<float>> values;
+};
+
+bool cache_lengths_are(const cuda_transformer::TinyModelIncrementalWorkspace& workspace,
+                       std::size_t expected) {
+  if (workspace.layer_caches == nullptr)
+    return false;
+  for (std::size_t layer = 0; layer < workspace.model_config.layers; ++layer) {
+    if (workspace.layer_caches[layer].current_length != expected)
+      return false;
+  }
+  return true;
+}
+
+bool snapshot_caches(const cuda_transformer::TinyModelIncrementalWorkspace& workspace,
+                     CacheSnapshot* snapshot, cudaStream_t stream) {
+  if (snapshot == nullptr || workspace.layer_caches == nullptr)
+    return false;
+  const std::size_t layer_count = workspace.model_config.layers;
+  const std::size_t elements = workspace.model_config.heads *
+                               workspace.max_sequence_length *
+                               workspace.model_config.head_dim;
+  snapshot->keys.assign(layer_count, std::vector<float>(elements));
+  snapshot->values.assign(layer_count, std::vector<float>(elements));
+  for (std::size_t layer = 0; layer < layer_count; ++layer) {
+    const auto& cache = workspace.layer_caches[layer];
+    if (!CTR_CUDA_CHECK(cudaMemcpyAsync(
+            snapshot->keys[layer].data(), cache.keys, elements * sizeof(float),
+            cudaMemcpyDeviceToHost, stream)) ||
+        !CTR_CUDA_CHECK(cudaMemcpyAsync(
+            snapshot->values[layer].data(), cache.values,
+            elements * sizeof(float), cudaMemcpyDeviceToHost, stream)))
+      return false;
+  }
+  return CTR_CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+bool cache_bytes_equal(const CacheSnapshot& left, const CacheSnapshot& right) {
+  if (left.keys.size() != right.keys.size() ||
+      left.values.size() != right.values.size())
+    return false;
+  for (std::size_t layer = 0; layer < left.keys.size(); ++layer) {
+    if (left.keys[layer].size() != right.keys[layer].size() ||
+        left.values[layer].size() != right.values[layer].size() ||
+        std::memcmp(left.keys[layer].data(), right.keys[layer].data(),
+                    left.keys[layer].size() * sizeof(float)) != 0 ||
+        std::memcmp(left.values[layer].data(), right.values[layer].data(),
+                    left.values[layer].size() * sizeof(float)) != 0)
+      return false;
+  }
+  return true;
+}
+
+bool cache_only_appended(const CacheSnapshot& before, const CacheSnapshot& after,
+                         std::size_t history, std::size_t heads,
+                         std::size_t max_sequence, std::size_t head_dim) {
+  if (before.keys.size() != after.keys.size() ||
+      before.values.size() != after.values.size() || history >= max_sequence)
+    return false;
+  const std::size_t bytes = head_dim * sizeof(float);
+  for (std::size_t layer = 0; layer < before.keys.size(); ++layer) {
+    for (std::size_t head = 0; head < heads; ++head) {
+      for (std::size_t position = 0; position < max_sequence; ++position) {
+        if (position == history)
+          continue;
+        const std::size_t offset =
+            (head * max_sequence + position) * head_dim;
+        if (std::memcmp(before.keys[layer].data() + offset,
+                        after.keys[layer].data() + offset, bytes) != 0 ||
+            std::memcmp(before.values[layer].data() + offset,
+                        after.values[layer].data() + offset, bytes) != 0)
+          return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool close_logits(const std::vector<float>& ordinary,
+                  const std::vector<float>& graph, float* max_error) {
+  if (ordinary.size() != graph.size() || max_error == nullptr)
+    return false;
+  *max_error = 0.0F;
+  for (std::size_t index = 0; index < ordinary.size(); ++index) {
+    const float tolerance = 1.0e-3F +
+                            2.0e-4F * fmaxf(1.0F, std::fabs(ordinary[index]));
+    const float error = std::fabs(ordinary[index] - graph[index]);
+    *max_error = fmaxf(*max_error, error);
+    if (!std::isfinite(ordinary[index]) || !std::isfinite(graph[index]) ||
+        error > tolerance)
+      return false;
+  }
+  return true;
+}
+
+bool graph_decode_experiment(
+    cublasHandle_t handle, const int* device_tokens,
+    cuda_transformer::TinyModelWeights device_weights,
+    cuda_transformer::TinyModelIncrementalWorkspace* workspace,
+    float* device_logits, std::size_t history, cudaStream_t stream) {
+  using Clock = std::chrono::steady_clock;
+  if (workspace == nullptr || stream == nullptr ||
+      !prefill_history(handle, device_tokens, history, device_weights, workspace,
+                       device_logits, stream) ||
+      !CTR_CUDA_CHECK(cudaStreamSynchronize(stream)) ||
+      !cache_lengths_are(*workspace, history))
+    return false;
+
+  CacheSnapshot prefix_cache;
+  if (!snapshot_caches(*workspace, &prefix_cache, stream))
+    return false;
+
+  if (!CTR_CUBLAS_CHECK(cuda_transformer::tiny_model_incremental_decode_cuda(
+          handle, device_tokens + history, device_weights, workspace,
+          device_logits, stream)) ||
+      !CTR_CUDA_CHECK(cudaStreamSynchronize(stream)) ||
+      !cache_lengths_are(*workspace, history + 1))
+    return false;
+  std::vector<float> ordinary_logits(workspace->model_config.vocabulary_size);
+  if (!CTR_CUDA_CHECK(cudaMemcpyAsync(
+          ordinary_logits.data(), device_logits,
+          ordinary_logits.size() * sizeof(float), cudaMemcpyDeviceToHost,
+          stream)) ||
+      !CTR_CUDA_CHECK(cudaStreamSynchronize(stream)))
+    return false;
+  CacheSnapshot ordinary_cache;
+  if (!snapshot_caches(*workspace, &ordinary_cache, stream) ||
+      !cache_only_appended(prefix_cache, ordinary_cache, history,
+                           workspace->model_config.heads,
+                           workspace->max_sequence_length,
+                           workspace->model_config.head_dim)) {
+    std::fputs("ordinary graph-reference decode modified cache outside append slot\n",
+               stderr);
+    return false;
+  }
+
+  if (!restore_cache_lengths(workspace, history))
+    return false;
+  cudaGraph_t graph = nullptr;
+  cudaGraphExec_t graph_exec = nullptr;
+  bool ok = true;
+  const auto capture_start = Clock::now();
+  if (!CTR_CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal))) {
+    ok = false;
+  } else {
+    const cublasStatus_t status = cuda_transformer::tiny_model_incremental_decode_cuda(
+        handle, device_tokens + history, device_weights, workspace,
+        device_logits, stream);
+    const cudaError_t end_error = cudaStreamEndCapture(stream, &graph);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+      std::fprintf(stderr, "graph capture decode failed: %s\n",
+                   cuda_transformer::cublas_status_name(status));
+      ok = false;
+    }
+    if (!CTR_CUDA_CHECK(end_error) || graph == nullptr)
+      ok = false;
+  }
+  const auto capture_stop = Clock::now();
+  const float capture_ms = std::chrono::duration<float, std::milli>(
+                               capture_stop - capture_start)
+                               .count();
+  if (ok && !cache_lengths_are(*workspace, history + 1)) {
+    std::fputs("capture did not advance host cache lengths exactly once\n", stderr);
+    ok = false;
+  }
+  const auto instantiate_start = Clock::now();
+  if (ok && !CTR_CUDA_CHECK(cudaGraphInstantiate(&graph_exec, graph, nullptr,
+                                                   nullptr, 0)))
+    ok = false;
+  const auto instantiate_stop = Clock::now();
+  const float instantiate_ms = std::chrono::duration<float, std::milli>(
+                                   instantiate_stop - instantiate_start)
+                                   .count();
+  if (ok && !restore_cache_lengths(workspace, history))
+    ok = false;
+
+  std::vector<float> graph_logits(workspace->model_config.vocabulary_size);
+  CacheSnapshot graph_cache;
+  float max_error = 0.0F;
+  if (ok && (!CTR_CUDA_CHECK(cudaGraphLaunch(graph_exec, stream)) ||
+             !CTR_CUDA_CHECK(cudaStreamSynchronize(stream)) ||
+             !cache_lengths_are(*workspace, history) ||
+             !CTR_CUDA_CHECK(cudaMemcpyAsync(
+                 graph_logits.data(), device_logits,
+                 graph_logits.size() * sizeof(float), cudaMemcpyDeviceToHost,
+                 stream)) ||
+             !CTR_CUDA_CHECK(cudaStreamSynchronize(stream)) ||
+             !close_logits(ordinary_logits, graph_logits, &max_error) ||
+             !snapshot_caches(*workspace, &graph_cache, stream) ||
+             !cache_bytes_equal(ordinary_cache, graph_cache))) {
+    std::fputs("graph replay correctness or cache-integrity check failed\n", stderr);
+    ok = false;
+  }
+  if (ok) {
+    std::printf("graph_capture context=%zu capture_ms=%.5f instantiate_ms=%.5f\n",
+                history, capture_ms, instantiate_ms);
+    std::printf("graph_correctness context=%zu max_logit_error=%.8g "
+                "cache_lengths=%zu prefix_and_append=pass\n",
+                history, max_error, history);
+  }
+
+  Stats ordinary_stats{};
+  Stats graph_stats{};
+  Stats graph_wall_stats{};
+  const auto prepare = [&] { return restore_cache_lengths(workspace, history); };
+  const auto ordinary_launch = [&] {
+    return CTR_CUBLAS_CHECK(cuda_transformer::tiny_model_incremental_decode_cuda(
+        handle, device_tokens + history, device_weights, workspace,
+        device_logits, stream));
+  };
+  const auto graph_launch = [&] {
+    return CTR_CUDA_CHECK(cudaGraphLaunch(graph_exec, stream));
+  };
+  if (ok && (!measure_gpu_batches(prepare, ordinary_launch,
+                                  kDecodeLaunchesPerBatch, &ordinary_stats,
+                                  stream) ||
+             !measure_gpu_batches(prepare, graph_launch, kDecodeLaunchesPerBatch,
+                                  &graph_stats, stream) ||
+             !measure_wall_batches(prepare, graph_launch, &graph_wall_stats,
+                                   stream)))
+    ok = false;
+  if (ok) {
+    const float reduction_ms = ordinary_stats.median_ms - graph_stats.median_ms;
+    const float reduction_percent =
+        100.0F * reduction_ms / ordinary_stats.median_ms;
+    const float speedup = ordinary_stats.median_ms / graph_stats.median_ms;
+    std::printf("ordinary_decode context=%zu median_ms=%.5f average_ms=%.5f "
+                "batches=%d launches_per_batch=%d\n",
+                history, ordinary_stats.median_ms, ordinary_stats.average_ms,
+                kBatches, kDecodeLaunchesPerBatch);
+    std::printf("graph_decode context=%zu median_ms=%.5f average_ms=%.5f "
+                "wall_median_ms=%.5f wall_average_ms=%.5f batches=%d "
+                "launches_per_batch=%d\n",
+                history, graph_stats.median_ms, graph_stats.average_ms,
+                graph_wall_stats.median_ms, graph_wall_stats.average_ms,
+                kBatches, kDecodeLaunchesPerBatch);
+    std::printf("graph_comparison context=%zu median_reduction_ms=%.5f "
+                "median_reduction_percent=%.2f speedup=%.3fx\n",
+                history, reduction_ms, reduction_percent, speedup);
+  }
+  if (graph_exec != nullptr && !CTR_CUDA_CHECK(cudaGraphExecDestroy(graph_exec)))
+    ok = false;
+  if (graph != nullptr && !CTR_CUDA_CHECK(cudaGraphDestroy(graph)))
+    ok = false;
+  return ok;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -457,9 +723,10 @@ int main(int argc, char** argv) {
                stderr);
     return EXIT_FAILURE;
   }
-  if (options.trace && options.trace_context >= max_context) {
+  if ((options.trace && options.trace_context >= max_context) ||
+      (options.graph_decode && options.graph_context >= max_context)) {
     std::fprintf(stderr,
-                 "trace decode context must be in [1, %zu] for this checkpoint\n",
+                 "decode context must be in [1, %zu] for this checkpoint\n",
                  max_context - 1);
     return EXIT_FAILURE;
   }
@@ -468,8 +735,11 @@ int main(int argc, char** argv) {
   cuda_transformer::TinyModelIncrementalWorkspace workspace;
   int* device_tokens = nullptr;
   float* device_logits = nullptr;
+  cudaStream_t graph_stream = nullptr;
   auto cleanup = [&] {
     bool ok = true;
+    if (graph_stream != nullptr && !CTR_CUDA_CHECK(cudaStreamDestroy(graph_stream)))
+      ok = false;
     if (device_logits != nullptr && !CTR_CUDA_CHECK(cudaFree(device_logits)))
       ok = false;
     if (device_tokens != nullptr && !CTR_CUDA_CHECK(cudaFree(device_tokens)))
@@ -512,6 +782,17 @@ int main(int argc, char** argv) {
               kWarmups, kBatches, kDecodeLaunchesPerBatch);
 
   bool ok = true;
+  if (options.graph_decode) {
+    if (!CTR_CUDA_CHECK(
+            cudaStreamCreateWithFlags(&graph_stream, cudaStreamNonBlocking))) {
+      cleanup();
+      return EXIT_FAILURE;
+    }
+    ok = graph_decode_experiment(handle, device_tokens, model.device_weights,
+                                 &workspace, device_logits,
+                                 options.graph_context, graph_stream);
+    return cleanup() && ok ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   if (options.trace) {
     ok = trace_decode(handle, device_tokens, model.device_weights, &workspace,
                       device_logits, options.trace_context,

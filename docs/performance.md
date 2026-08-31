@@ -36,6 +36,17 @@ Trace only repeated fixed-context real-model decode with:
   --trace-decode-context 128 --trace-iterations 20
 ```
 
+## Fixed-context CUDA Graph experiment
+
+`--graph-decode-context 128` creates a dedicated non-default stream, pre-fills
+the real model outside capture, captures exactly one device-native decode, and
+instantiates one graph executable. Capture/instantiation wall time is reported
+separately. Before timing, it compares graph logits with ordinary decode using
+the existing FP32 tolerance and verifies byte-identical full K/V cache contents
+against ordinary decode. It restores host cache lengths before every replay,
+so this is valid only for the one captured context and is not production
+autoregressive graph support.
+
 ## End-to-end decoder-block decode
 
 | History | Full-prefix ms | Cached ms | Speedup |

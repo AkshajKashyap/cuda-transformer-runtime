@@ -101,6 +101,17 @@ nsys profile --trace=cuda,cublas --sample=none \
   --trace-decode-context 128 --trace-iterations 20
 ```
 
+The isolated fixed-context CUDA Graph experiment captures one device-native
+decode on a dedicated non-default stream. It is not general generation support:
+the captured RoPE/cache position and attention length are valid only for the
+selected history. It checks ordinary-versus-graph logits and K/V cache bytes
+before timing replay.
+
+```bash
+./build/src/cuda_llama2_benchmark models/stories15M.bin models/tokenizer.bin \
+  --graph-decode-context 128
+```
+
 Run selected benchmarks after a successful build:
 
 ```bash
