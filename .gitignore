@@ -21,4 +21,7 @@ __pycache__/
 *.sqlite-journal
 *.nsys-rep.*
 
+# External llama2.c checkpoints are intentionally local-only.
+models/*.bin
+
 compile_commands.json

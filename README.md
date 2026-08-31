@@ -19,6 +19,8 @@ performance engineering.
   vocabulary logits using deterministic or caller-supplied weights.
 - CPU reference implementations and focused CTest coverage for each composed
   stage.
+- Legacy `llama2.c` FP32 checkpoint loading with one-time layout adaptation for
+  the `stories15M.bin` TinyStories model.
 - CUDA-event benchmarks and Nsight Systems trace support.
 - Two Nsight-driven optimizations: no steady-state GPU allocation and a
   long-context cooperative probability × value (P×V) reduction.
@@ -36,6 +38,23 @@ cmake -S . -B build -G Ninja
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```
+
+### Optional real checkpoint
+
+The repository does not track model files. Download the legacy FP32
+`llama2.c` checkpoint locally, then run the opt-in CPU-vs-CUDA integration
+check with integer token IDs:
+
+```bash
+mkdir -p models
+curl -L https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.bin \
+  -o models/stories15M.bin
+./build/src/cuda_llama2_checkpoint_integration models/stories15M.bin
+```
+
+`models/*.bin` is gitignored. The loader supports the original 28-byte legacy
+FP32 header used by this file, not the newer versioned or quantized llama2.c
+formats.
 
 Run selected benchmarks after a successful build:
 
@@ -101,6 +120,27 @@ host token IDs, validates them, and copies them into workspace-owned device
 storage. The model uses two reusable activation buffers: layers alternate their
 input/output roles, so odd and even layer counts both select the correct final
 activation without dynamic GPU allocation during forward execution.
+
+### Legacy llama2.c checkpoint boundary
+
+`Llama2CheckpointModel` owns adapted host tensors for the independent CPU
+oracle and one-time CUDA allocations for the runtime. It provides non-owning
+`TinyModelWeights` views for each path, so ordinary full forward, cached decode,
+and greedy generation do not allocate or upload model weights.
+
+The target legacy file stores PyTorch linear matrices as `[output, input]`,
+whereas this runtime evaluates row-major `X[rows, input] * W[input, output]`.
+The loader therefore explicitly transposes Wq/Wk/Wv/Wo, W1/W2/W3, and the
+classifier during setup. Embeddings and RMSNorm scales are copied directly.
+For tied classifiers, the embedding table is still transposed into a separate
+`[hidden, vocabulary]` LM-head allocation; this preserves mathematical tying
+while satisfying the two runtime layouts. Legacy RoPE frequency arrays are
+validated in the file size then skipped because RoPE is computed algorithmically.
+
+Only equal query/KV head counts are currently supported: checkpoints with
+`n_kv_heads != n_heads` are rejected rather than treated as grouped-query
+attention. The runtime and legacy reference both use even/odd RoPE pairs with
+base 10000 and RMSNorm epsilon `1e-5`.
 
 ### Tiny model-level incremental decode
 
@@ -283,9 +323,11 @@ command-line override.
 
 - FP32 only; no FP16/BF16, Tensor Core, or quantized path.
 - No pretrained checkpoint loader or real pretrained-model inference.
-- No tokenizer, checkpoint loader, probabilistic sampling, or pretrained-model
-  generation workflow; greedy generation uses supplied synthetic/caller weights.
+- No tokenizer, probabilistic sampling, or pretrained-model generation workflow;
+  the real checkpoint path accepts integer token IDs only.
 - Model-level prefill is sequential and correctness-first, not optimized.
+- Only legacy FP32 llama2.c checkpoints with equal query/KV head counts are
+  supported; no newer versioned/quantized formats or grouped-query attention.
 - No FlashAttention, paged KV cache, CUDA Graphs, or multi-GPU execution.
 - Batch size is 1 for both the tiny full-sequence model and incremental decode.
 - Handwritten kernels favor educational clarity and measured bottlenecks, not

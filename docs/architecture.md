@@ -104,6 +104,35 @@ still execute embedding, cached decoder blocks, final RMSNorm, and LM-head
 projection, while the host only manages control flow, copies small logits, and
 selects IDs.
 
+## Legacy llama2.c checkpoint loading
+
+`Llama2CheckpointModel` is the ownership boundary above the non-owning
+`TinyModelWeights` API. It parses the original `llama2.c` FP32 header (seven
+`int32_t` fields), validates dimensions, equal query/KV head counts, overflow-
+safe tensor counts, and exact file size, then retains adapted host weights for
+`tiny_model_forward_cpu` and uploads adapted device weights once. Its destructor
+and explicit `reset()` release every device allocation.
+
+The legacy tensor order is embedding, attention RMSNorm, Wq/Wk/Wv/Wo, FFN
+RMSNorm, W1/W2/W3, final RMSNorm, two obsolete RoPE-frequency arrays, then an
+optional untied classifier. A positive legacy vocabulary size means the
+classifier is tied to embeddings; a negative value means the final classifier
+matrix is physically present. The obsolete arrays are counted and skipped, not
+treated as model parameters.
+
+External PyTorch linear weights are `[output, input]`, while this runtime's
+row-major linear helper computes `X * W[input, output]`. Loading explicitly
+transposes all linear weights at this boundary: Q/K/V/O; W1 to runtime gate; W3
+to runtime up; W2 to runtime down; and the LM head. The embedding table and
+RMSNorm scales are already layout-compatible. A tied classifier consequently
+has two physical GPU views—embedding `[vocab, hidden]` and transposed LM head
+`[hidden, vocab]`—while retaining the same mathematical values.
+
+The runtime's algorithmic RoPE matches legacy llama2.c's absolute position,
+even/odd pairing, and base 10000. Both implementations use RMSNorm epsilon
+`1e-5`. Grouped-query/multi-query checkpoints are deliberately rejected until
+the attention and cache layouts represent `n_kv_heads < n_heads` correctly.
+
 ## Incremental flow
 
 `incremental_decoder_block_cuda` accepts one `[1, hidden]` token plus an

@@ -67,6 +67,11 @@ target_include_directories(cuda_tiny_model PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(cuda_tiny_model
     PUBLIC cuda_decoder_block cuda_transformer_primitives cuda_gemm)
 
+add_library(cuda_llama2_checkpoint STATIC cuda/llama2_checkpoint.cu)
+target_include_directories(cuda_llama2_checkpoint
+    PUBLIC ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(cuda_llama2_checkpoint PUBLIC cuda_tiny_model)
+
 add_library(cuda_incremental_decoder_block STATIC cuda/incremental_decoder_block.cu)
 target_include_directories(cuda_incremental_decoder_block
     PUBLIC ${PROJECT_SOURCE_DIR}/include)
@@ -115,6 +120,17 @@ add_test(NAME cuda_decoder_block_test COMMAND cuda_decoder_block_test)
 add_executable(cuda_tiny_model_test cuda_tiny_model_test.cu)
 target_link_libraries(cuda_tiny_model_test PRIVATE cuda_tiny_model)
 add_test(NAME cuda_tiny_model_test COMMAND cuda_tiny_model_test)
+
+add_executable(cuda_llama2_checkpoint_test cuda_llama2_checkpoint_test.cu)
+target_link_libraries(cuda_llama2_checkpoint_test PRIVATE cuda_llama2_checkpoint)
+add_test(NAME cuda_llama2_checkpoint_test COMMAND cuda_llama2_checkpoint_test)
+
+# Opt-in only: this accepts a locally downloaded external checkpoint and is not
+# registered with CTest so offline builds remain self-contained.
+add_executable(cuda_llama2_checkpoint_integration
+    cuda_llama2_checkpoint_integration.cu)
+target_link_libraries(cuda_llama2_checkpoint_integration
+    PRIVATE cuda_llama2_checkpoint)
 
 add_executable(cuda_incremental_decoder_block_equivalence_test
     cuda_incremental_decoder_block_equivalence_test.cu)
