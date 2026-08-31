@@ -6,6 +6,7 @@
 #include "cuda_transformer/transformer_primitives.h"
 
 #include <cmath>
+#include <limits>
 #include <new>
 #include <vector>
 
@@ -229,6 +230,42 @@ bool incremental_decode_preflight(const TinyModelIncrementalWorkspace* workspace
 bool valid_token_id(int token_id, TinyModelConfig config) {
   return token_id >= 0 &&
          static_cast<std::size_t>(token_id) < config.vocabulary_size;
+}
+
+bool valid_prompt_token_ids(const int* token_ids, std::size_t count,
+                            TinyModelConfig config) {
+  if (token_ids == nullptr || count == 0)
+    return false;
+  for (std::size_t position = 0; position < count; ++position)
+    if (!valid_token_id(token_ids[position], config))
+      return false;
+  return true;
+}
+
+bool generation_preflight(const int* host_prompt_token_ids,
+                          std::size_t prompt_length,
+                          TinyModelWeights weights,
+                          const TinyModelIncrementalWorkspace* workspace,
+                          std::size_t max_new_tokens,
+                          const int* host_generated_token_ids,
+                          const float* device_logits) {
+  if (!incremental_workspace_structure_matches(workspace) ||
+      !valid_weights(weights, workspace->model_config) ||
+      !valid_prompt_token_ids(host_prompt_token_ids, prompt_length,
+                              workspace->model_config))
+    return false;
+  if (max_new_tokens == 0)
+    return true;
+  if (host_generated_token_ids == nullptr || device_logits == nullptr)
+    return false;
+
+  // The prompt is always decoded. Each generated token except the final one
+  // is decoded to obtain logits for its successor.
+  const std::size_t generated_decodes = max_new_tokens - 1;
+  if (prompt_length > std::numeric_limits<std::size_t>::max() -
+                          generated_decodes)
+    return false;
+  return prompt_length + generated_decodes <= workspace->max_sequence_length;
 }
 
 void decoder_block_cpu(const float* input, DecoderBlockWeights weights,
@@ -623,6 +660,87 @@ cublasStatus_t tiny_model_incremental_prefill_cuda(
         device_logits, stream);
     if (status != CUBLAS_STATUS_SUCCESS)
       return status;
+  }
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+bool tiny_model_greedy_argmax_host(const float* host_logits,
+                                   std::size_t vocabulary_size,
+                                   int* selected_token_id) {
+  if (host_logits == nullptr || selected_token_id == nullptr ||
+      vocabulary_size == 0 ||
+      vocabulary_size >
+          static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+      !std::isfinite(host_logits[0]))
+    return false;
+
+  std::size_t best = 0;
+  for (std::size_t token = 1; token < vocabulary_size; ++token) {
+    if (!std::isfinite(host_logits[token]))
+      return false;
+    // Strictly greater preserves the lower ID when values are tied exactly.
+    if (host_logits[token] > host_logits[best])
+      best = token;
+  }
+  *selected_token_id = static_cast<int>(best);
+  return true;
+}
+
+cublasStatus_t tiny_model_generate_greedy_cuda(
+    cublasHandle_t handle, const int* host_prompt_token_ids,
+    std::size_t prompt_length, TinyModelWeights device_weights,
+    TinyModelIncrementalWorkspace* workspace, std::size_t max_new_tokens,
+    int* host_generated_token_ids, float* device_logits, cudaStream_t stream) {
+  if (handle == nullptr ||
+      !generation_preflight(host_prompt_token_ids, prompt_length,
+                            device_weights, workspace, max_new_tokens,
+                            host_generated_token_ids, device_logits))
+    return CUBLAS_STATUS_INVALID_VALUE;
+
+  // A zero-token request is intentionally a no-op: it does not discard a
+  // caller's existing cache history or require output storage.
+  if (max_new_tokens == 0)
+    return CUBLAS_STATUS_SUCCESS;
+
+  cudaError_t cuda_error = tiny_model_incremental_workspace_reset(workspace);
+  if (cuda_error != cudaSuccess)
+    return CUBLAS_STATUS_EXECUTION_FAILED;
+
+  std::vector<float> host_logits(workspace->model_config.vocabulary_size);
+  for (std::size_t position = 0; position < prompt_length; ++position) {
+    const cublasStatus_t status = tiny_model_incremental_decode_host_token_cuda(
+        handle, host_prompt_token_ids[position], device_weights, workspace,
+        device_logits, stream);
+    if (status != CUBLAS_STATUS_SUCCESS)
+      return status;
+  }
+
+  cuda_error = cudaMemcpyAsync(host_logits.data(), device_logits,
+                               host_logits.size() * sizeof(float),
+                               cudaMemcpyDeviceToHost, stream);
+  if (cuda_error != cudaSuccess || cudaStreamSynchronize(stream) != cudaSuccess)
+    return CUBLAS_STATUS_EXECUTION_FAILED;
+
+  for (std::size_t generated = 0; generated < max_new_tokens; ++generated) {
+    int next_token = -1;
+    if (!tiny_model_greedy_argmax_host(host_logits.data(), host_logits.size(),
+                                       &next_token))
+      return CUBLAS_STATUS_EXECUTION_FAILED;
+    host_generated_token_ids[generated] = next_token;
+
+    // The final selected token has no successor to score, so deliberately do
+    // not decode it or consume an unnecessary cache position.
+    if (generated + 1 == max_new_tokens)
+      break;
+    const cublasStatus_t status = tiny_model_incremental_decode_host_token_cuda(
+        handle, next_token, device_weights, workspace, device_logits, stream);
+    if (status != CUBLAS_STATUS_SUCCESS)
+      return status;
+    cuda_error = cudaMemcpyAsync(host_logits.data(), device_logits,
+                                 host_logits.size() * sizeof(float),
+                                 cudaMemcpyDeviceToHost, stream);
+    if (cuda_error != cudaSuccess || cudaStreamSynchronize(stream) != cudaSuccess)
+      return CUBLAS_STATUS_EXECUTION_FAILED;
   }
   return CUBLAS_STATUS_SUCCESS;
 }

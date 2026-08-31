@@ -13,7 +13,8 @@ performance engineering.
 
 - FP32 pre-norm LLaMA-style decoder blocks and tiny model-level forward path
   in C++20/CUDA.
-- Full-sequence and model-level KV-cached one-token decoding.
+- Full-sequence, model-level KV-cached one-token decoding, and deterministic
+  greedy generation.
 - Complete model-level LLaMA-style forward execution from integer token IDs to
   vocabulary logits using deterministic or caller-supplied weights.
 - CPU reference implementations and focused CTest coverage for each composed
@@ -119,6 +120,28 @@ Before decoding, the runtime checks every layer cache/workspace for matching
 shape, capacity, and logical length, preventing predictable partial cache
 advancement. The correctness-oriented prefill helper repeats this same
 incremental path for each prefix token; it is not an optimized parallel prefill.
+
+### Deterministic greedy generation
+
+`tiny_model_generate_greedy_cuda` is a small host-orchestrated wrapper around
+the existing cached decode path. For a non-empty host prompt, it logically
+resets the incremental workspace, processes every prompt token once, copies the
+last prompt token's `[vocabulary]` logits to the host, and selects the largest
+logit. Exact ties select the lowest token ID. Each selected token is decoded
+only when its successor logits are needed; no custom GPU argmax is used.
+
+For prompt `[7, 19, 4]`, if the logits after `4` choose `82`, logits after
+processing `82` choose `11`, and logits after processing `11` choose `39`, then
+`max_new_tokens=3` returns `[82, 11, 39]`. The cache contains
+`[7, 19, 4, 82, 11]` and has logical length 5: `39` is returned but not decoded,
+because its successor is not requested. In general a nonzero request processes
+`prompt_length + max_new_tokens - 1` tokens. This requirement is preflighted
+against cache capacity before the helper resets or mutates predictable state.
+
+Greedy generation synchronizes after each device-to-host logits copy so the CPU
+can select the next ID. The underlying device-native one-token decode remains
+asynchronous and allocation-free after setup. This is correctness-first model
+composition, not a tokens/sec benchmark or a production generation loop.
 
 ### Incremental cached decode
 
@@ -260,7 +283,8 @@ command-line override.
 
 - FP32 only; no FP16/BF16, Tensor Core, or quantized path.
 - No pretrained checkpoint loader or real pretrained-model inference.
-- No tokenizer, generation loop, or sampling.
+- No tokenizer, checkpoint loader, probabilistic sampling, or pretrained-model
+  generation workflow; greedy generation uses supplied synthetic/caller weights.
 - Model-level prefill is sequential and correctness-first, not optimized.
 - No FlashAttention, paged KV cache, CUDA Graphs, or multi-GPU execution.
 - Batch size is 1 for both the tiny full-sequence model and incremental decode.

@@ -80,6 +80,30 @@ prefix token. It may do unnecessary final normalization and LM-head work; that
 is accepted here to reuse the validated decode path for correctness rather than
 introducing an optimized parallel prefill.
 
+## Greedy generation flow
+
+`tiny_model_generate_greedy_cuda` is a host-orchestrated convenience layer; it
+does not replace the device-native incremental API. It validates a non-empty
+host prompt, output storage, weights/workspace structure, and the full cache
+requirement before resetting logical cache lengths. For `P` prompt tokens and
+`G > 0` returned tokens, the helper needs capacity for `P + G - 1` processed
+tokens. An impossible request fails before reset or predictable cache mutation.
+A zero-token request is a no-op.
+
+After processing the prompt through the existing one-token decode API, the
+helper copies `[1, vocabulary_size]` logits to host memory and synchronizes the
+chosen stream. CPU argmax selects the largest finite logit, retaining the
+lowest token ID for exact ties. It decodes each selected token except the final
+one, because only a decoded token produces logits for its successor.
+
+For example, prompt `[7, 19, 4]` with selected IDs `[82, 11, 39]` processes and
+caches `[7, 19, 4, 82, 11]`; `39` is returned without a needless final decode.
+Thus the final cache length is five, not six. The per-step host synchronization
+is required by this simple CPU argmax implementation; CUDA kernels and cuBLAS
+still execute embedding, cached decoder blocks, final RMSNorm, and LM-head
+projection, while the host only manages control flow, copies small logits, and
+selects IDs.
+
 ## Incremental flow
 
 `incremental_decoder_block_cuda` accepts one `[1, hidden]` token plus an

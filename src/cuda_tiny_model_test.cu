@@ -618,6 +618,145 @@ bool incremental_model_test(cublasHandle_t handle, std::size_t layers,
   return cleanup() && ok;
 }
 
+bool greedy_argmax_test() {
+  int selected = -1;
+  const std::vector<float> tied{2.0F, -1.0F, 2.0F, 1.0F};
+  const std::vector<float> unique{-3.0F, 4.0F, 1.0F};
+  return cuda_transformer::tiny_model_greedy_argmax_host(
+             tied.data(), tied.size(), &selected) &&
+         selected == 0 &&
+         cuda_transformer::tiny_model_greedy_argmax_host(
+             unique.data(), unique.size(), &selected) &&
+         selected == 1 &&
+         !cuda_transformer::tiny_model_greedy_argmax_host(nullptr, tied.size(),
+                                                           &selected) &&
+         !cuda_transformer::tiny_model_greedy_argmax_host(
+             tied.data(), 0, &selected);
+}
+
+bool generation_test(cublasHandle_t handle, std::size_t layers,
+                     const std::vector<int>& prompt,
+                     std::size_t max_new_tokens,
+                     std::size_t max_sequence_length, const char* name) {
+  using namespace cuda_transformer;
+  const TinyModelConfig config{128, 5, 64, layers, 4, 16, 128, 1e-5F};
+  HostWeights host;
+  make_host_weights(&host, config);
+
+  DeviceWeights device_weights;
+  TinyModelIncrementalWorkspace generated_workspace;
+  TinyModelIncrementalWorkspace manual_workspace;
+  float *device_generated_logits = nullptr, *device_manual_logits = nullptr;
+  auto cleanup = [&] {
+    bool ok = true;
+    for (float* pointer : {device_generated_logits, device_manual_logits})
+      if (pointer != nullptr && !CTR_CUDA_CHECK(cudaFree(pointer)))
+        ok = false;
+    if (!CTR_CUDA_CHECK(
+            tiny_model_incremental_workspace_destroy(&generated_workspace)))
+      ok = false;
+    if (!CTR_CUDA_CHECK(tiny_model_incremental_workspace_destroy(&manual_workspace)))
+      ok = false;
+    if (!free_device_weights(&device_weights))
+      ok = false;
+    return ok;
+  };
+  if (!make_device_weights(&device_weights, host, config) ||
+      !CTR_CUDA_CHECK(tiny_model_incremental_workspace_create(
+          &generated_workspace, config, max_sequence_length)) ||
+      !CTR_CUDA_CHECK(tiny_model_incremental_workspace_create(
+          &manual_workspace, config, max_sequence_length)) ||
+      !CTR_CUDA_CHECK(cudaMalloc(&device_generated_logits,
+                                 config.vocabulary_size * sizeof(float))) ||
+      !CTR_CUDA_CHECK(cudaMalloc(&device_manual_logits,
+                                 config.vocabulary_size * sizeof(float)))) {
+    cleanup();
+    return false;
+  }
+
+  const std::size_t expected_cache_length =
+      prompt.size() + max_new_tokens - 1;
+  std::vector<int> manual_generated(max_new_tokens);
+  std::vector<float> host_logits(config.vocabulary_size);
+  bool ok = CTR_CUDA_CHECK(tiny_model_incremental_workspace_reset(
+      &manual_workspace));
+  for (std::size_t position = 0; position < prompt.size() && ok; ++position)
+    ok = CTR_CUBLAS_CHECK(tiny_model_incremental_decode_host_token_cuda(
+        handle, prompt[position], device_weights.view, &manual_workspace,
+        device_manual_logits));
+
+  if (ok) {
+    ok = CTR_CUDA_CHECK(cudaMemcpy(host_logits.data(), device_manual_logits,
+                                   host_logits.size() * sizeof(float),
+                                   cudaMemcpyDeviceToHost));
+  }
+  for (std::size_t generated = 0; generated < max_new_tokens && ok;
+       ++generated) {
+    ok = tiny_model_greedy_argmax_host(host_logits.data(), host_logits.size(),
+                                       &manual_generated[generated]);
+    if (generated + 1 == max_new_tokens)
+      break;
+    ok = ok && CTR_CUBLAS_CHECK(tiny_model_incremental_decode_host_token_cuda(
+                   handle, manual_generated[generated], device_weights.view,
+                   &manual_workspace, device_manual_logits)) &&
+         CTR_CUDA_CHECK(cudaMemcpy(host_logits.data(), device_manual_logits,
+                                   host_logits.size() * sizeof(float),
+                                   cudaMemcpyDeviceToHost));
+  }
+  ok = ok && cache_lengths_are(manual_workspace, expected_cache_length);
+
+  std::vector<int> generated(max_new_tokens), repeated(max_new_tokens);
+  ok = ok && CTR_CUBLAS_CHECK(tiny_model_generate_greedy_cuda(
+                 handle, prompt.data(), prompt.size(), device_weights.view,
+                 &generated_workspace, max_new_tokens, generated.data(),
+                 device_generated_logits)) &&
+       generated == manual_generated &&
+       cache_lengths_are(generated_workspace, expected_cache_length);
+  for (std::size_t index = 0; index < generated.size() && ok; ++index)
+    if (generated[index] < 0 ||
+        static_cast<std::size_t>(generated[index]) >= config.vocabulary_size) {
+      std::fprintf(stderr, "%s generated invalid token at %zu: %d\n", name,
+                   index, generated[index]);
+      ok = false;
+    }
+
+  // A repeated request resets logically and must reproduce exactly the same
+  // host-orchestrated greedy sequence.
+  ok = ok && CTR_CUBLAS_CHECK(tiny_model_generate_greedy_cuda(
+                 handle, prompt.data(), prompt.size(), device_weights.view,
+                 &generated_workspace, max_new_tokens, repeated.data(),
+                 device_generated_logits)) &&
+       generated == repeated &&
+       cache_lengths_are(generated_workspace, expected_cache_length);
+
+  // Zero generation is deliberately a no-op, even if a prior request filled
+  // the cache. Empty and invalid prompts are rejected before reset/mutation.
+  ok = ok && tiny_model_generate_greedy_cuda(
+                 handle, prompt.data(), prompt.size(), device_weights.view,
+                 &generated_workspace, 0, nullptr, nullptr) ==
+                 CUBLAS_STATUS_SUCCESS &&
+       cache_lengths_are(generated_workspace, expected_cache_length);
+  const std::vector<int> invalid_prompt{-1};
+  ok = ok && tiny_model_generate_greedy_cuda(
+                 handle, invalid_prompt.data(), invalid_prompt.size(),
+                 device_weights.view, &generated_workspace, 1, generated.data(),
+                 device_generated_logits) == CUBLAS_STATUS_INVALID_VALUE &&
+       tiny_model_generate_greedy_cuda(
+           handle, nullptr, 0, device_weights.view, &generated_workspace, 1,
+           generated.data(), device_generated_logits) == CUBLAS_STATUS_INVALID_VALUE &&
+       cache_lengths_are(generated_workspace, expected_cache_length);
+
+  // This requires one more decoded token than the exact-boundary request.
+  // Generation preflights before reset, so the existing logical cache history
+  // must survive the rejection unchanged.
+  ok = ok && tiny_model_generate_greedy_cuda(
+                 handle, prompt.data(), prompt.size(), device_weights.view,
+                 &generated_workspace, max_new_tokens + 1, generated.data(),
+                 device_generated_logits) == CUBLAS_STATUS_INVALID_VALUE &&
+       cache_lengths_are(generated_workspace, expected_cache_length);
+  return cleanup() && ok;
+}
+
 bool invalid_config_test() {
   cuda_transformer::TinyModelWorkspace workspace;
   const cuda_transformer::TinyModelConfig invalid{128, 5, 64, 0, 4, 16,
@@ -629,7 +768,7 @@ bool invalid_config_test() {
 }  // namespace
 
 int main() {
-  if (!invalid_config_test() || !embedding_test())
+  if (!invalid_config_test() || !greedy_argmax_test() || !embedding_test())
     return EXIT_FAILURE;
   cublasHandle_t handle = nullptr;
   if (!CTR_CUBLAS_CHECK(cublasCreate(&handle)))
@@ -640,7 +779,11 @@ int main() {
       incremental_model_test(handle, 1, {7, 7, 4, 7, 11},
                              "one-layer repeated cached model") &&
       incremental_model_test(handle, 2, {7, 19, 4, 82, 11},
-                             "two-layer cached model");
+                             "two-layer cached model") &&
+      generation_test(handle, 1, {7}, 1, 1,
+                      "one-layer single-token greedy generation") &&
+      generation_test(handle, 2, {7, 19, 4}, 3, 5,
+                      "two-layer multi-token greedy generation");
   if (!CTR_CUBLAS_CHECK(cublasDestroy(handle)))
     return EXIT_FAILURE;
   if (!ok)

@@ -148,4 +148,28 @@ cublasStatus_t tiny_model_incremental_prefill_cuda(
     TinyModelIncrementalWorkspace* workspace, float* device_logits,
     cudaStream_t stream = nullptr);
 
+// Selects the largest finite logit. Exact ties keep the first (lowest) token
+// ID. Returns false for null, empty, non-finite, or unrepresentable inputs.
+bool tiny_model_greedy_argmax_host(const float* host_logits,
+                                   std::size_t vocabulary_size,
+                                   int* selected_token_id);
+
+// Host-orchestrated greedy generation from host prompt IDs. For a nonzero
+// max_new_tokens, this first logically resets the supplied incremental
+// workspace, then processes the prompt and returns max_new_tokens selected
+// IDs in host_generated_token_ids. device_logits is caller-owned [1, vocab]
+// storage. CPU argmax requires a stream synchronization after each logits
+// copy; the lower-level device-native decode API remains asynchronous.
+//
+// The final returned generated ID is not decoded: it has no successor logits
+// to produce. Therefore, on success each layer's cache length is
+// prompt_length + max_new_tokens - 1. A zero-token request succeeds without
+// resetting or otherwise mutating the workspace.
+cublasStatus_t tiny_model_generate_greedy_cuda(
+    cublasHandle_t handle, const int* host_prompt_token_ids,
+    std::size_t prompt_length, TinyModelWeights device_weights,
+    TinyModelIncrementalWorkspace* workspace, std::size_t max_new_tokens,
+    int* host_generated_token_ids, float* device_logits,
+    cudaStream_t stream = nullptr);
+
 }  // namespace cuda_transformer
