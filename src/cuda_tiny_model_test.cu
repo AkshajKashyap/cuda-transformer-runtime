@@ -110,7 +110,7 @@ void make_host_weights(HostWeights* host,
         weights.mlp_norm.data(), weights.w_gate.data(), weights.w_up.data(),
         weights.w_down.data()};
   }
-  host->view = {host->embeddings.data(), host->layer_views.data(),
+  host->view = {host->embeddings.data(), host->layer_views.data(), config.layers,
                 host->final_norm.data(), host->lm_head.data()};
 }
 
@@ -147,7 +147,7 @@ bool make_device_weights(DeviceWeights* device, const HostWeights& host,
     device->layer_views[layer].decoder.mlp = {
         target.mlp_norm, target.w_gate, target.w_up, target.w_down};
   }
-  device->view = {device->embeddings, device->layer_views.data(),
+  device->view = {device->embeddings, device->layer_views.data(), config.layers,
                   device->final_norm, device->lm_head};
   return true;
 }
@@ -356,6 +356,268 @@ bool model_test(cublasHandle_t handle, std::size_t layers,
   return cleanup() && ok;
 }
 
+bool check_row_values(const char* name, const std::vector<float>& gpu,
+                      const std::vector<float>& reference,
+                      cuda_transformer::TinyModelConfig config) {
+  if (gpu.size() != config.vocabulary_size ||
+      reference.size() != config.vocabulary_size) {
+    std::fprintf(stderr, "%s logits row shape mismatch: gpu=%zu reference=%zu\n",
+                 name, gpu.size(), reference.size());
+    return false;
+  }
+  for (std::size_t index = 0; index < gpu.size(); ++index) {
+    const float tolerance =
+        1e-3F + 2e-4F * fmaxf(1.0F, std::fabs(reference[index]));
+    if (!std::isfinite(gpu[index]) || !std::isfinite(reference[index]) ||
+        std::fabs(gpu[index] - reference[index]) > tolerance) {
+      std::fprintf(stderr,
+                   "%s mismatch: layers=%zu index=%zu gpu=%.8g reference=%.8g "
+                   "error=%.8g tolerance=%.8g\n",
+                   name, config.layers, index, gpu[index], reference[index],
+                   std::fabs(gpu[index] - reference[index]), tolerance);
+      return false;
+    }
+  }
+  return true;
+}
+
+bool check_cache_history(const std::vector<float>& before_keys,
+                         const std::vector<float>& before_values,
+                         const std::vector<float>& after_keys,
+                         const std::vector<float>& after_values,
+                         cuda_transformer::TinyModelConfig config,
+                         std::size_t max_sequence_length,
+                         std::size_t history_length, std::size_t layer) {
+  for (std::size_t head = 0; head < config.heads; ++head)
+    for (std::size_t position = 0; position < history_length; ++position)
+      for (std::size_t dimension = 0; dimension < config.head_dim; ++dimension) {
+        const std::size_t index =
+            (head * max_sequence_length + position) * config.head_dim + dimension;
+        if (before_keys[index] != after_keys[index] ||
+            before_values[index] != after_values[index]) {
+          std::fprintf(stderr,
+                       "cache history changed: layer=%zu head=%zu position=%zu "
+                       "dimension=%zu\n",
+                       layer, head, position, dimension);
+          return false;
+        }
+      }
+  return true;
+}
+
+bool cache_lengths_are(const cuda_transformer::TinyModelIncrementalWorkspace& state,
+                       std::size_t expected) {
+  for (std::size_t layer = 0; layer < state.model_config.layers; ++layer)
+    if (state.layer_caches[layer].current_length != expected) {
+      std::fprintf(stderr, "cache length mismatch: layer=%zu got=%zu expected=%zu\n",
+                   layer, state.layer_caches[layer].current_length, expected);
+      return false;
+    }
+  return true;
+}
+
+bool incremental_model_test(cublasHandle_t handle, std::size_t layers,
+                            const std::vector<int>& token_ids,
+                            const char* name) {
+  using namespace cuda_transformer;
+  constexpr std::size_t kPrefixLength = 4;
+  constexpr std::size_t kMaxSequenceLength = 8;
+  const TinyModelConfig config{128, 5, 64, layers, 4, 16, 128, 1e-5F};
+  HostWeights host;
+  make_host_weights(&host, config);
+  std::vector<float> cpu_logits(config.sequence * config.vocabulary_size);
+  if (!tiny_model_forward_cpu(token_ids.data(), host.view, config,
+                              cpu_logits.data())) {
+    std::fprintf(stderr, "%s CPU model reference failed\n", name);
+    return false;
+  }
+
+  DeviceWeights device_weights;
+  TinyModelWorkspace full_workspace;
+  TinyModelIncrementalWorkspace incremental_workspace;
+  int *device_token_ids = nullptr, *device_capacity_tokens = nullptr;
+  float *device_full_logits = nullptr, *device_incremental_logits = nullptr;
+  auto cleanup = [&] {
+    bool ok = true;
+    for (int* pointer : {device_token_ids, device_capacity_tokens})
+      if (pointer != nullptr && !CTR_CUDA_CHECK(cudaFree(pointer)))
+        ok = false;
+    for (float* pointer : {device_full_logits, device_incremental_logits})
+      if (pointer != nullptr && !CTR_CUDA_CHECK(cudaFree(pointer)))
+        ok = false;
+    if (!CTR_CUDA_CHECK(tiny_model_workspace_destroy(&full_workspace)))
+      ok = false;
+    if (!CTR_CUDA_CHECK(
+            tiny_model_incremental_workspace_destroy(&incremental_workspace)))
+      ok = false;
+    if (!free_device_weights(&device_weights))
+      ok = false;
+    return ok;
+  };
+  const std::vector<int> capacity_tokens{7, 19, 4, 82, 11, 6, 6, 3};
+  if (!make_device_weights(&device_weights, host, config) ||
+      !CTR_CUDA_CHECK(tiny_model_workspace_create(&full_workspace, config)) ||
+      !CTR_CUDA_CHECK(tiny_model_incremental_workspace_create(
+          &incremental_workspace, config, kMaxSequenceLength)) ||
+      !CTR_CUDA_CHECK(cudaMalloc(&device_token_ids,
+                                 token_ids.size() * sizeof(int))) ||
+      !CTR_CUDA_CHECK(cudaMalloc(&device_capacity_tokens,
+                                 capacity_tokens.size() * sizeof(int))) ||
+      !CTR_CUDA_CHECK(cudaMalloc(&device_full_logits,
+                                 cpu_logits.size() * sizeof(float))) ||
+      !CTR_CUDA_CHECK(cudaMalloc(&device_incremental_logits,
+                                 config.vocabulary_size * sizeof(float))) ||
+      !CTR_CUDA_CHECK(cudaMemcpy(device_token_ids, token_ids.data(),
+                                 token_ids.size() * sizeof(int),
+                                 cudaMemcpyHostToDevice)) ||
+      !CTR_CUDA_CHECK(cudaMemcpy(device_capacity_tokens, capacity_tokens.data(),
+                                 capacity_tokens.size() * sizeof(int),
+                                 cudaMemcpyHostToDevice))) {
+    cleanup();
+    return false;
+  }
+
+  std::vector<float> full_gpu(cpu_logits.size());
+  bool ok = CTR_CUBLAS_CHECK(tiny_model_forward_cuda(
+      handle, device_token_ids, device_weights.view, &full_workspace,
+      device_full_logits)) &&
+            CTR_CUDA_CHECK(cudaDeviceSynchronize()) &&
+            CTR_CUDA_CHECK(cudaMemcpy(full_gpu.data(), device_full_logits,
+                                      full_gpu.size() * sizeof(float),
+                                      cudaMemcpyDeviceToHost)) &&
+            check_values("full model before incremental equivalence", full_gpu,
+                         cpu_logits, config);
+  std::vector<float> full_final(config.vocabulary_size);
+  for (std::size_t index = 0; index < config.vocabulary_size; ++index)
+    full_final[index] = full_gpu[kPrefixLength * config.vocabulary_size + index];
+
+  ok = ok && CTR_CUBLAS_CHECK(tiny_model_incremental_prefill_cuda(
+                 handle, device_token_ids, kPrefixLength, device_weights.view,
+                 &incremental_workspace, device_incremental_logits)) &&
+       CTR_CUDA_CHECK(cudaDeviceSynchronize()) &&
+       cache_lengths_are(incremental_workspace, kPrefixLength);
+
+  TinyModelWeights wrong_layer_count = device_weights.view;
+  --wrong_layer_count.layer_count;
+  ok = ok && tiny_model_incremental_decode_cuda(
+                 handle, device_token_ids + kPrefixLength, wrong_layer_count,
+                 &incremental_workspace, device_incremental_logits) ==
+                 CUBLAS_STATUS_INVALID_VALUE &&
+       cache_lengths_are(incremental_workspace, kPrefixLength);
+
+  const std::size_t cache_count =
+      config.heads * kMaxSequenceLength * config.head_dim;
+  std::vector<std::vector<float>> before_keys(
+      layers, std::vector<float>(cache_count));
+  std::vector<std::vector<float>> before_values(
+      layers, std::vector<float>(cache_count));
+  for (std::size_t layer = 0; layer < layers && ok; ++layer) {
+    ok = CTR_CUDA_CHECK(cudaMemcpy(before_keys[layer].data(),
+                                   incremental_workspace.layer_caches[layer].keys,
+                                   cache_count * sizeof(float),
+                                   cudaMemcpyDeviceToHost)) &&
+         CTR_CUDA_CHECK(cudaMemcpy(before_values[layer].data(),
+                                   incremental_workspace.layer_caches[layer].values,
+                                   cache_count * sizeof(float),
+                                   cudaMemcpyDeviceToHost));
+  }
+
+  const float* first_keys = incremental_workspace.layer_caches[0].keys;
+  const float* first_values = incremental_workspace.layer_caches[0].values;
+  for (std::size_t layer = 1; layer < layers && ok; ++layer) {
+    if (incremental_workspace.layer_caches[layer].keys == first_keys ||
+        incremental_workspace.layer_caches[layer].values == first_values) {
+      std::fprintf(stderr, "%s shares cache storage between layers\n", name);
+      ok = false;
+    }
+  }
+
+  std::vector<float> incremental_logits(config.vocabulary_size);
+  ok = ok && CTR_CUBLAS_CHECK(tiny_model_incremental_decode_cuda(
+                 handle, device_token_ids + kPrefixLength, device_weights.view,
+                 &incremental_workspace, device_incremental_logits)) &&
+       CTR_CUDA_CHECK(cudaDeviceSynchronize()) &&
+       CTR_CUDA_CHECK(cudaMemcpy(incremental_logits.data(),
+                                 device_incremental_logits,
+                                 incremental_logits.size() * sizeof(float),
+                                 cudaMemcpyDeviceToHost)) &&
+       check_row_values(name, incremental_logits, full_final, config) &&
+       cache_lengths_are(incremental_workspace, kPrefixLength + 1) &&
+       tiny_model_incremental_decode_host_token_cuda(
+           handle, -1, device_weights.view, &incremental_workspace,
+           device_incremental_logits) == CUBLAS_STATUS_INVALID_VALUE &&
+       cache_lengths_are(incremental_workspace, kPrefixLength + 1);
+
+  for (std::size_t layer = 0; layer < layers && ok; ++layer) {
+    std::vector<float> after_keys(cache_count), after_values(cache_count);
+    ok = CTR_CUDA_CHECK(cudaMemcpy(after_keys.data(),
+                                   incremental_workspace.layer_caches[layer].keys,
+                                   cache_count * sizeof(float),
+                                   cudaMemcpyDeviceToHost)) &&
+         CTR_CUDA_CHECK(cudaMemcpy(after_values.data(),
+                                   incremental_workspace.layer_caches[layer].values,
+                                   cache_count * sizeof(float),
+                                   cudaMemcpyDeviceToHost)) &&
+         check_cache_history(before_keys[layer], before_values[layer], after_keys,
+                             after_values, config, kMaxSequenceLength,
+                             kPrefixLength, layer);
+  }
+
+  std::vector<const float*> saved_keys(layers), saved_values(layers);
+  for (std::size_t layer = 0; layer < layers; ++layer) {
+    saved_keys[layer] = incremental_workspace.layer_caches[layer].keys;
+    saved_values[layer] = incremental_workspace.layer_caches[layer].values;
+  }
+  const float* saved_activation_a = incremental_workspace.activation_a;
+  ok = ok &&
+       CTR_CUBLAS_CHECK(tiny_model_incremental_prefill_cuda(
+           handle, device_capacity_tokens + kPrefixLength, 3, device_weights.view,
+           &incremental_workspace, device_incremental_logits)) &&
+       CTR_CUDA_CHECK(cudaDeviceSynchronize()) &&
+       cache_lengths_are(incremental_workspace, kMaxSequenceLength) &&
+       tiny_model_incremental_decode_cuda(
+           handle, device_capacity_tokens, device_weights.view,
+           &incremental_workspace, device_incremental_logits) ==
+           CUBLAS_STATUS_INVALID_VALUE &&
+       cache_lengths_are(incremental_workspace, kMaxSequenceLength);
+
+  ok = ok && CTR_CUDA_CHECK(
+                 tiny_model_incremental_workspace_reset(&incremental_workspace)) &&
+       cache_lengths_are(incremental_workspace, 0) &&
+       incremental_workspace.activation_a == saved_activation_a;
+  for (std::size_t layer = 0; layer < layers && ok; ++layer)
+    ok = incremental_workspace.layer_caches[layer].keys == saved_keys[layer] &&
+         incremental_workspace.layer_caches[layer].values == saved_values[layer];
+
+  if (layers > 1) {
+    // Deliberately corrupt public logical metadata. Preflight must reject
+    // before launching layer 0, so neither cache can be advanced.
+    incremental_workspace.layer_caches[1].current_length = 1;
+    ok = ok && tiny_model_incremental_decode_cuda(
+                   handle, device_token_ids, device_weights.view,
+                   &incremental_workspace, device_incremental_logits) ==
+                   CUBLAS_STATUS_INVALID_VALUE &&
+         incremental_workspace.layer_caches[0].current_length == 0 &&
+         incremental_workspace.layer_caches[1].current_length == 1;
+    incremental_workspace.layer_caches[1].current_length = 0;
+  }
+
+  std::vector<float> repeated_logits(config.vocabulary_size);
+  ok = ok && CTR_CUBLAS_CHECK(tiny_model_incremental_prefill_cuda(
+                 handle, device_token_ids, kPrefixLength, device_weights.view,
+                 &incremental_workspace, device_incremental_logits)) &&
+       CTR_CUBLAS_CHECK(tiny_model_incremental_decode_cuda(
+           handle, device_token_ids + kPrefixLength, device_weights.view,
+           &incremental_workspace, device_incremental_logits)) &&
+       CTR_CUDA_CHECK(cudaDeviceSynchronize()) &&
+       CTR_CUDA_CHECK(cudaMemcpy(repeated_logits.data(), device_incremental_logits,
+                                 repeated_logits.size() * sizeof(float),
+                                 cudaMemcpyDeviceToHost)) &&
+       check_identical(incremental_logits, repeated_logits,
+                       "reset-prefill-decode determinism");
+  return cleanup() && ok;
+}
+
 bool invalid_config_test() {
   cuda_transformer::TinyModelWorkspace workspace;
   const cuda_transformer::TinyModelConfig invalid{128, 5, 64, 0, 4, 16,
@@ -374,7 +636,11 @@ int main() {
     return EXIT_FAILURE;
   const bool ok =
       model_test(handle, 1, {3, 3, 7, 3, 11}, "one-layer tiny model") &&
-      model_test(handle, 2, {0, 5, 127, 1, 42}, "two-layer tiny model");
+      model_test(handle, 2, {0, 5, 127, 1, 42}, "two-layer tiny model") &&
+      incremental_model_test(handle, 1, {7, 7, 4, 7, 11},
+                             "one-layer repeated cached model") &&
+      incremental_model_test(handle, 2, {7, 19, 4, 82, 11},
+                             "two-layer cached model");
   if (!CTR_CUBLAS_CHECK(cublasDestroy(handle)))
     return EXIT_FAILURE;
   if (!ok)

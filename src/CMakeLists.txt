@@ -74,6 +74,9 @@ target_link_libraries(cuda_incremental_decoder_block
     PUBLIC cuda_qkv_projection cuda_incremental_attention cuda_qkv_layout
            cuda_gemm cuda_transformer_primitives)
 
+target_link_libraries(cuda_tiny_model
+    PUBLIC cuda_incremental_decoder_block cuda_kv_cache)
+
 add_executable(cuda_qkv_projection_test cuda_qkv_projection_test.cu)
 target_link_libraries(cuda_qkv_projection_test PRIVATE cuda_qkv_projection)
 add_test(NAME cuda_qkv_projection_test COMMAND cuda_qkv_projection_test)

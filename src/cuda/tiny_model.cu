@@ -71,7 +71,8 @@ bool valid_layer_weights(DecoderBlockWeights weights) {
 
 bool valid_weights(TinyModelWeights weights, TinyModelConfig config) {
   if (weights.token_embeddings == nullptr || weights.layers == nullptr ||
-      weights.final_norm_weight == nullptr || weights.lm_head_weight == nullptr)
+      weights.layer_count != config.layers || weights.final_norm_weight == nullptr ||
+      weights.lm_head_weight == nullptr)
     return false;
   for (std::size_t layer = 0; layer < config.layers; ++layer)
     if (!valid_layer_weights(weights.layers[layer].decoder))
@@ -114,6 +115,120 @@ bool valid_token_ids(const int* token_ids, TinyModelConfig config) {
 
 cudaError_t first_error(cudaError_t first, cudaError_t next) {
   return first == cudaSuccess ? next : first;
+}
+
+void clear_incremental(TinyModelIncrementalWorkspace* workspace) {
+  workspace->copied_token_id = nullptr;
+  workspace->activation_a = nullptr;
+  workspace->activation_b = nullptr;
+  workspace->layer_workspaces = nullptr;
+  workspace->layer_caches = nullptr;
+  workspace->model_config = {};
+  workspace->allocation_model_config = {};
+  workspace->max_sequence_length = 0;
+  workspace->allocation_max_sequence_length = 0;
+}
+
+IncrementalDecoderBlockConfig incremental_layer_config(
+    TinyModelConfig config, std::size_t max_sequence_length) {
+  return {config.hidden, config.heads, config.head_dim, config.intermediate,
+          config.rmsnorm_epsilon, config.rmsnorm_epsilon, max_sequence_length};
+}
+
+bool incremental_workspace_is_empty(
+    const TinyModelIncrementalWorkspace* workspace) {
+  return workspace != nullptr && workspace->copied_token_id == nullptr &&
+         workspace->activation_a == nullptr && workspace->activation_b == nullptr &&
+         workspace->layer_workspaces == nullptr && workspace->layer_caches == nullptr;
+}
+
+bool incremental_block_workspace_matches(
+    const IncrementalDecoderBlockWorkspace& workspace,
+    IncrementalDecoderBlockConfig expected) {
+  const IncrementalDecoderBlockConfig config = workspace.config;
+  const IncrementalDecoderBlockConfig allocation = workspace.allocation_config;
+  return config.hidden == expected.hidden && config.heads == expected.heads &&
+         config.head_dim == expected.head_dim &&
+         config.intermediate == expected.intermediate &&
+         config.attention_rmsnorm_epsilon == expected.attention_rmsnorm_epsilon &&
+         config.mlp_rmsnorm_epsilon == expected.mlp_rmsnorm_epsilon &&
+         config.max_sequence == expected.max_sequence &&
+         allocation.hidden == expected.hidden && allocation.heads == expected.heads &&
+         allocation.head_dim == expected.head_dim &&
+         allocation.intermediate == expected.intermediate &&
+         allocation.attention_rmsnorm_epsilon == expected.attention_rmsnorm_epsilon &&
+         allocation.mlp_rmsnorm_epsilon == expected.mlp_rmsnorm_epsilon &&
+         allocation.max_sequence == expected.max_sequence &&
+         workspace.qkv.q_token != nullptr && workspace.qkv.k_token != nullptr &&
+         workspace.qkv.v_token != nullptr && workspace.qkv.q_head != nullptr &&
+         workspace.qkv.k_head != nullptr && workspace.qkv.v_head != nullptr &&
+         workspace.qkv.config.sequence == 1 &&
+         workspace.qkv.config.hidden == expected.hidden &&
+         workspace.qkv.config.heads == expected.heads &&
+         workspace.qkv.config.head_dim == expected.head_dim &&
+         workspace.attention.rotated_q != nullptr &&
+         workspace.attention.rotated_k != nullptr && workspace.attention.scores != nullptr &&
+         workspace.attention.heads == expected.heads &&
+         workspace.attention.head_dim == expected.head_dim &&
+         workspace.attention.max_sequence == expected.max_sequence &&
+         workspace.attention_normalized != nullptr && workspace.attention_head != nullptr &&
+         workspace.attention_token != nullptr && workspace.attention_projected != nullptr &&
+         workspace.attention_residual != nullptr && workspace.mlp_normalized != nullptr &&
+         workspace.gate != nullptr && workspace.up != nullptr &&
+         workspace.activated_gate != nullptr && workspace.gated != nullptr &&
+         workspace.down != nullptr;
+}
+
+bool cache_matches(const KvCache& cache, TinyModelConfig config,
+                   std::size_t max_sequence_length) {
+  return cache.keys != nullptr && cache.values != nullptr && cache.batch == 1 &&
+         cache.heads == config.heads && cache.head_dim == config.head_dim &&
+         cache.max_sequence == max_sequence_length &&
+         cache.current_length <= max_sequence_length;
+}
+
+bool incremental_workspace_structure_matches(
+    const TinyModelIncrementalWorkspace* workspace) {
+  if (workspace == nullptr || !valid_tiny_model_config(workspace->model_config) ||
+      !configs_match(workspace->model_config, workspace->allocation_model_config) ||
+      workspace->max_sequence_length == 0 ||
+      workspace->max_sequence_length != workspace->allocation_max_sequence_length ||
+      workspace->copied_token_id == nullptr || workspace->activation_a == nullptr ||
+      workspace->activation_b == nullptr || workspace->layer_workspaces == nullptr ||
+      workspace->layer_caches == nullptr)
+    return false;
+  const IncrementalDecoderBlockConfig expected = incremental_layer_config(
+      workspace->model_config, workspace->max_sequence_length);
+  for (std::size_t layer = 0; layer < workspace->model_config.layers; ++layer)
+    if (!incremental_block_workspace_matches(workspace->layer_workspaces[layer],
+                                             expected) ||
+        !cache_matches(workspace->layer_caches[layer], workspace->model_config,
+                       workspace->max_sequence_length))
+      return false;
+  return true;
+}
+
+bool incremental_decode_preflight(const TinyModelIncrementalWorkspace* workspace,
+                                  TinyModelWeights weights,
+                                  std::size_t* current_length) {
+  if (!incremental_workspace_structure_matches(workspace) ||
+      !valid_weights(weights, workspace->model_config))
+    return false;
+  const std::size_t length = workspace->layer_caches[0].current_length;
+  if (length >= workspace->max_sequence_length)
+    return false;
+  for (std::size_t layer = 1; layer < workspace->model_config.layers; ++layer)
+    if (workspace->layer_caches[layer].current_length != length ||
+        workspace->layer_caches[layer].current_length >=
+            workspace->max_sequence_length)
+      return false;
+  *current_length = length;
+  return true;
+}
+
+bool valid_token_id(int token_id, TinyModelConfig config) {
+  return token_id >= 0 &&
+         static_cast<std::size_t>(token_id) < config.vocabulary_size;
 }
 
 void decoder_block_cpu(const float* input, DecoderBlockWeights weights,
@@ -346,6 +461,170 @@ cublasStatus_t tiny_model_forward_host_tokens_cuda(
     return CUBLAS_STATUS_EXECUTION_FAILED;
   return tiny_model_forward_cuda(handle, workspace->copied_token_ids,
                                  device_weights, workspace, device_logits, stream);
+}
+
+cudaError_t tiny_model_incremental_workspace_create(
+    TinyModelIncrementalWorkspace* workspace, TinyModelConfig model_config,
+    std::size_t max_sequence_length) {
+  if (workspace == nullptr || !incremental_workspace_is_empty(workspace) ||
+      !valid_tiny_model_config(model_config) || max_sequence_length == 0)
+    return cudaErrorInvalidValue;
+
+  workspace->layer_workspaces =
+      new (std::nothrow) IncrementalDecoderBlockWorkspace[model_config.layers];
+  workspace->layer_caches = new (std::nothrow) KvCache[model_config.layers];
+  if (workspace->layer_workspaces == nullptr || workspace->layer_caches == nullptr) {
+    delete[] workspace->layer_workspaces;
+    delete[] workspace->layer_caches;
+    clear_incremental(workspace);
+    return cudaErrorMemoryAllocation;
+  }
+  workspace->allocation_model_config = model_config;
+  workspace->allocation_max_sequence_length = max_sequence_length;
+
+  const std::size_t token_bytes = sizeof(int);
+  const std::size_t activation_bytes = model_config.hidden * sizeof(float);
+  cudaError_t error = cudaMalloc(&workspace->copied_token_id, token_bytes);
+  if (error == cudaSuccess)
+    error = cudaMalloc(&workspace->activation_a, activation_bytes);
+  if (error == cudaSuccess)
+    error = cudaMalloc(&workspace->activation_b, activation_bytes);
+  const IncrementalDecoderBlockConfig block_config = incremental_layer_config(
+      model_config, max_sequence_length);
+  for (std::size_t layer = 0; error == cudaSuccess && layer < model_config.layers;
+       ++layer) {
+    error = kv_cache_create(&workspace->layer_caches[layer], 1, model_config.heads,
+                            max_sequence_length, model_config.head_dim);
+    if (error == cudaSuccess)
+      error = incremental_decoder_block_workspace_create(
+          &workspace->layer_workspaces[layer], block_config);
+  }
+  if (error != cudaSuccess) {
+    tiny_model_incremental_workspace_destroy(workspace);
+  } else {
+    workspace->model_config = model_config;
+    workspace->max_sequence_length = max_sequence_length;
+  }
+  return error;
+}
+
+cudaError_t tiny_model_incremental_workspace_destroy(
+    TinyModelIncrementalWorkspace* workspace) {
+  if (workspace == nullptr)
+    return cudaErrorInvalidValue;
+
+  cudaError_t error = cudaSuccess;
+  const std::size_t layers = workspace->allocation_model_config.layers;
+  if (workspace->layer_workspaces != nullptr) {
+    for (std::size_t layer = 0; layer < layers; ++layer)
+      error = first_error(error, incremental_decoder_block_workspace_destroy(
+                                     &workspace->layer_workspaces[layer]));
+    delete[] workspace->layer_workspaces;
+  }
+  if (workspace->layer_caches != nullptr) {
+    for (std::size_t layer = 0; layer < layers; ++layer)
+      error = first_error(error, kv_cache_destroy(&workspace->layer_caches[layer]));
+    delete[] workspace->layer_caches;
+  }
+  if (workspace->copied_token_id != nullptr)
+    error = first_error(error, cudaFree(workspace->copied_token_id));
+  if (workspace->activation_a != nullptr)
+    error = first_error(error, cudaFree(workspace->activation_a));
+  if (workspace->activation_b != nullptr)
+    error = first_error(error, cudaFree(workspace->activation_b));
+  clear_incremental(workspace);
+  return error;
+}
+
+cudaError_t tiny_model_incremental_workspace_reset(
+    TinyModelIncrementalWorkspace* workspace) {
+  if (!incremental_workspace_structure_matches(workspace))
+    return cudaErrorInvalidValue;
+  for (std::size_t layer = 0; layer < workspace->model_config.layers; ++layer)
+    kv_cache_reset(&workspace->layer_caches[layer]);
+  return cudaSuccess;
+}
+
+cublasStatus_t tiny_model_incremental_decode_cuda(
+    cublasHandle_t handle, const int* device_token_id,
+    TinyModelWeights device_weights, TinyModelIncrementalWorkspace* workspace,
+    float* device_logits, cudaStream_t stream) {
+  std::size_t current_length = 0;
+  if (handle == nullptr || device_token_id == nullptr || device_logits == nullptr ||
+      !incremental_decode_preflight(workspace, device_weights, &current_length))
+    return CUBLAS_STATUS_INVALID_VALUE;
+  (void)current_length;
+
+  const TinyModelConfig config = workspace->model_config;
+  cudaError_t cuda_error = embedding_lookup_cuda(
+      device_token_id, device_weights.token_embeddings, workspace->activation_a, 1,
+      config.vocabulary_size, config.hidden, stream);
+  if (cuda_error != cudaSuccess)
+    return CUBLAS_STATUS_EXECUTION_FAILED;
+
+  const float* current = workspace->activation_a;
+  float* next = workspace->activation_b;
+  for (std::size_t layer = 0; layer < config.layers; ++layer) {
+    const IncrementalDecoderBlockWeights layer_weights{
+        device_weights.layers[layer].decoder.attention,
+        device_weights.layers[layer].decoder.mlp};
+    const cublasStatus_t status = incremental_decoder_block_cuda(
+        handle, current, layer_weights,
+        &workspace->layer_caches[layer], &workspace->layer_workspaces[layer], next,
+        stream);
+    if (status != CUBLAS_STATUS_SUCCESS)
+      return status;
+    current = next;
+    next = next == workspace->activation_a ? workspace->activation_b
+                                            : workspace->activation_a;
+  }
+  cuda_error = rmsnorm_cuda(current, device_weights.final_norm_weight, next, 1,
+                             config.hidden, config.rmsnorm_epsilon, stream);
+  if (cuda_error != cudaSuccess)
+    return CUBLAS_STATUS_EXECUTION_FAILED;
+  return linear_cublas_row_major(handle, next, device_weights.lm_head_weight,
+                                 device_logits, 1, config.hidden,
+                                 config.vocabulary_size, stream);
+}
+
+cublasStatus_t tiny_model_incremental_decode_host_token_cuda(
+    cublasHandle_t handle, int host_token_id, TinyModelWeights device_weights,
+    TinyModelIncrementalWorkspace* workspace, float* device_logits,
+    cudaStream_t stream) {
+  std::size_t current_length = 0;
+  if (handle == nullptr || device_logits == nullptr ||
+      !incremental_decode_preflight(workspace, device_weights, &current_length) ||
+      !valid_token_id(host_token_id, workspace->model_config))
+    return CUBLAS_STATUS_INVALID_VALUE;
+  const cudaError_t error = cudaMemcpyAsync(
+      workspace->copied_token_id, &host_token_id, sizeof(int),
+      cudaMemcpyHostToDevice, stream);
+  if (error != cudaSuccess)
+    return CUBLAS_STATUS_EXECUTION_FAILED;
+  return tiny_model_incremental_decode_cuda(handle, workspace->copied_token_id,
+                                            device_weights, workspace,
+                                            device_logits, stream);
+}
+
+cublasStatus_t tiny_model_incremental_prefill_cuda(
+    cublasHandle_t handle, const int* device_token_ids,
+    std::size_t prefix_length, TinyModelWeights device_weights,
+    TinyModelIncrementalWorkspace* workspace, float* device_logits,
+    cudaStream_t stream) {
+  std::size_t current_length = 0;
+  if (handle == nullptr || device_logits == nullptr ||
+      !incremental_decode_preflight(workspace, device_weights, &current_length) ||
+      (prefix_length != 0 && device_token_ids == nullptr) ||
+      prefix_length > workspace->max_sequence_length - current_length)
+    return CUBLAS_STATUS_INVALID_VALUE;
+  for (std::size_t position = 0; position < prefix_length; ++position) {
+    const cublasStatus_t status = tiny_model_incremental_decode_cuda(
+        handle, device_token_ids + position, device_weights, workspace,
+        device_logits, stream);
+    if (status != CUBLAS_STATUS_SUCCESS)
+      return status;
+  }
+  return CUBLAS_STATUS_SUCCESS;
 }
 
 }  // namespace cuda_transformer

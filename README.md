@@ -13,7 +13,7 @@ performance engineering.
 
 - FP32 pre-norm LLaMA-style decoder blocks and tiny model-level forward path
   in C++20/CUDA.
-- Full-sequence causal attention and cached one-token incremental decoding.
+- Full-sequence and model-level KV-cached one-token decoding.
 - Complete model-level LLaMA-style forward execution from integer token IDs to
   vocabulary logits using deterministic or caller-supplied weights.
 - CPU reference implementations and focused CTest coverage for each composed
@@ -100,6 +100,25 @@ host token IDs, validates them, and copies them into workspace-owned device
 storage. The model uses two reusable activation buffers: layers alternate their
 input/output roles, so odd and even layer counts both select the correct final
 activation without dynamic GPU allocation during forward execution.
+
+### Tiny model-level incremental decode
+
+```text
+device token ID [1]
+→ embedding lookup [1, hidden]
+→ incremental decoder block 0 with cache 0
+→ ...
+→ incremental decoder block N-1 with cache N-1
+→ final RMSNorm → LM-head projection → logits [1, vocabulary]
+```
+
+Each layer owns independent K/V cache storage and one-token scratch. The
+incremental workspace receives an explicit `max_sequence_length` cache capacity;
+it is distinct from the full-sequence length used by `tiny_model_forward_cuda`.
+Before decoding, the runtime checks every layer cache/workspace for matching
+shape, capacity, and logical length, preventing predictable partial cache
+advancement. The correctness-oriented prefill helper repeats this same
+incremental path for each prefix token; it is not an optimized parallel prefill.
 
 ### Incremental cached decode
 
@@ -224,7 +243,7 @@ Exact test cases and tolerances are kept in the focused test sources under
 - `src/cuda/attention_sublayer.cu`, `mlp_sublayer.cu`, `decoder_block.cu`:
   full decoder-block composition.
 - `src/cuda/tiny_model.cu`: device-native embedding-to-logits model
-  orchestration and a CPU correctness oracle.
+  orchestration, CPU correctness oracle, and model-level cached decoding.
 - `src/cuda/incremental_decoder_block.cu`: production cached one-token block.
 - `src/*benchmark.cu`: standalone CUDA-event benchmarks; `src/*test.cu`:
   CTest executables and CPU/GPU checks.
@@ -242,7 +261,7 @@ command-line override.
 - FP32 only; no FP16/BF16, Tensor Core, or quantized path.
 - No pretrained checkpoint loader or real pretrained-model inference.
 - No tokenizer, generation loop, or sampling.
-- No model-level incremental decoding or KV-cache orchestration.
+- Model-level prefill is sequential and correctness-first, not optimized.
 - No FlashAttention, paged KV cache, CUDA Graphs, or multi-GPU execution.
 - Batch size is 1 for both the tiny full-sequence model and incremental decode.
 - Handwritten kernels favor educational clarity and measured bottlenecks, not

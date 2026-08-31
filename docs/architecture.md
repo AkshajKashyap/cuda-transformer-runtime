@@ -52,6 +52,34 @@ device token-ID buffer only for the optional host-token convenience wrapper and
 an array of reusable `DecoderBlockWorkspace` objects. Setup allocates these
 buffers once; successful core forwards allocate and free nothing.
 
+## Tiny model incremental flow
+
+`TinyModelIncrementalWorkspace` is separate from the full-sequence workspace.
+It owns two `[1, hidden]` activation buffers, optional host-wrapper token
+storage, and one `IncrementalDecoderBlockWorkspace` plus one `KvCache` for
+every model layer. Its `max_sequence_length` cache capacity is an explicit
+creation argument, not `TinyModelConfig::sequence`; a full forward might use a
+length-5 input while its incremental cache has capacity 128.
+
+`tiny_model_incremental_decode_cuda` accepts one device token ID and enqueues:
+
+```text
+token ID → embedding → incremental layer 0/cache 0 → ...
+         → incremental layer N-1/cache N-1 → final RMSNorm → LM head
+```
+
+Before launching embedding or any layer, it validates every cache and workspace:
+matching layer count and weights, `[1, heads, max_sequence_length, head_dim]`
+cache shape, equal logical lengths, and capacity for one more token. This avoids
+predictable divergence where an early layer appends before a later layer is
+found invalid. CUDA execution remains asynchronous, so it does not claim a
+transactional rollback for unforeseen asynchronous device failures.
+
+The prefill helper deliberately invokes the same one-token model path for each
+prefix token. It may do unnecessary final normalization and LM-head work; that
+is accepted here to reuse the validated decode path for correctness rather than
+introducing an optimized parallel prefill.
+
 ## Incremental flow
 
 `incremental_decoder_block_cuda` accepts one `[1, hidden]` token plus an

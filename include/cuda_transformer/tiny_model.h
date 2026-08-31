@@ -1,6 +1,7 @@
 #pragma once
 
 #include "cuda_transformer/decoder_block.h"
+#include "cuda_transformer/incremental_decoder_block.h"
 
 #include <cstddef>
 
@@ -27,6 +28,7 @@ struct TinyModelLayerWeights {
 struct TinyModelWeights {
   const float* token_embeddings = nullptr;  // [vocabulary_size, hidden]
   const TinyModelLayerWeights* layers = nullptr;
+  std::size_t layer_count = 0;
   const float* final_norm_weight = nullptr;  // [hidden]
   const float* lm_head_weight = nullptr;     // [hidden, vocabulary_size]
 };
@@ -88,5 +90,62 @@ cublasStatus_t tiny_model_forward_host_tokens_cuda(
     cublasHandle_t handle, const int* host_token_ids,
     TinyModelWeights device_weights, TinyModelWorkspace* workspace,
     float* device_logits, cudaStream_t stream = nullptr);
+
+// Separate state for one-token decoding. `max_sequence_length` is cache
+// capacity, intentionally distinct from TinyModelConfig::sequence, which
+// describes a full-sequence model forward. Every layer owns a separate cache
+// and incremental decoder-block workspace.
+struct TinyModelIncrementalWorkspace {
+  int* copied_token_id = nullptr;
+  float* activation_a = nullptr;
+  float* activation_b = nullptr;
+  IncrementalDecoderBlockWorkspace* layer_workspaces = nullptr;
+  KvCache* layer_caches = nullptr;
+  TinyModelConfig model_config{};
+  TinyModelConfig allocation_model_config{};
+  std::size_t max_sequence_length = 0;
+  std::size_t allocation_max_sequence_length = 0;
+
+  TinyModelIncrementalWorkspace() = default;
+  TinyModelIncrementalWorkspace(const TinyModelIncrementalWorkspace&) = delete;
+  TinyModelIncrementalWorkspace& operator=(
+      const TinyModelIncrementalWorkspace&) = delete;
+};
+
+cudaError_t tiny_model_incremental_workspace_create(
+    TinyModelIncrementalWorkspace* workspace, TinyModelConfig model_config,
+    std::size_t max_sequence_length);
+cudaError_t tiny_model_incremental_workspace_destroy(
+    TinyModelIncrementalWorkspace* workspace);
+
+// Resets only logical cache lengths. It preserves all device allocations and
+// cached bytes; later decodes overwrite positions starting at zero.
+cudaError_t tiny_model_incremental_workspace_reset(
+    TinyModelIncrementalWorkspace* workspace);
+
+// Core device-native cached decode. device_token_id is [1] and device_logits
+// is [1, vocabulary_size]. It preflights every layer's cache/workspace before
+// launching work, then enqueues one-token embedding, all incremental blocks,
+// final RMSNorm, and LM head without synchronization or allocation.
+cublasStatus_t tiny_model_incremental_decode_cuda(
+    cublasHandle_t handle, const int* device_token_id,
+    TinyModelWeights device_weights, TinyModelIncrementalWorkspace* workspace,
+    float* device_logits, cudaStream_t stream = nullptr);
+
+// Host-token convenience wrapper. It validates the one host token, copies it
+// to workspace-owned device storage, and then calls the core API.
+cublasStatus_t tiny_model_incremental_decode_host_token_cuda(
+    cublasHandle_t handle, int host_token_id, TinyModelWeights device_weights,
+    TinyModelIncrementalWorkspace* workspace, float* device_logits,
+    cudaStream_t stream = nullptr);
+
+// Correctness-first sequential prefill. Each prefix token follows the exact
+// incremental path, including final RMSNorm and LM head, so this is not an
+// optimized parallel transformer prefill implementation.
+cublasStatus_t tiny_model_incremental_prefill_cuda(
+    cublasHandle_t handle, const int* device_token_ids,
+    std::size_t prefix_length, TinyModelWeights device_weights,
+    TinyModelIncrementalWorkspace* workspace, float* device_logits,
+    cudaStream_t stream = nullptr);
 
 }  // namespace cuda_transformer
