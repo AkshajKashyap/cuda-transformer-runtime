@@ -68,6 +68,7 @@ curl -L https://github.com/karpathy/llama2.c/raw/master/tokenizer.bin \
 ./build/src/cuda_llama2_tokenizer_integration models/tokenizer.bin
 ./build/src/cuda_llama2_generate models/stories15M.bin models/tokenizer.bin \
   "Once upon a time" 64
+./build/src/cuda_llama2_benchmark models/stories15M.bin models/tokenizer.bin
 ```
 
 The generation CLI prints the original prompt plus continuation and the
@@ -76,6 +77,29 @@ a generated BOS token (`1`) is the sequence delimiter. This is intentionally
 scoped to the target reference behavior; EOS remains token `2` and is not a
 universal stopping convention. BOS/EOS marker strings are omitted from the
 user-facing rendered continuation.
+
+### Real-model performance baseline
+
+`cuda_llama2_benchmark` is an opt-in `stories15M` characterization executable;
+checkpoint/tokenizer loading, workspace allocation, and one-time prompt upload
+finish before steady-state measurement. It reports CUDA-event GPU timing for
+the correctness-first sequential incremental prefill and fixed-history complete
+cached model decode, plus wall-clock prefill timing through stream completion.
+It also reports wall-clock timing for the current 32k-logit D2H copy +
+synchronization + CPU argmax and full greedy generation. The latter includes
+the current per-token host/device synchronization and is not comparable to the
+GPU-only decode number.
+
+For a narrow real-model Nsight Systems trace, setup and history prefill occur
+before the profiler range:
+
+```bash
+nsys profile --trace=cuda,cublas --sample=none \
+  --capture-range=cudaProfilerApi --capture-range-end=stop \
+  -o stories15m_decode_h128 \
+  ./build/src/cuda_llama2_benchmark models/stories15M.bin models/tokenizer.bin \
+  --trace-decode-context 128 --trace-iterations 20
+```
 
 Run selected benchmarks after a successful build:
 

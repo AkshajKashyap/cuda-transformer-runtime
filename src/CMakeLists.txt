@@ -90,6 +90,12 @@ add_executable(cuda_llama2_generate cuda_llama2_generate.cu)
 target_link_libraries(cuda_llama2_generate
     PRIVATE cuda_llama2_checkpoint cuda_llama2_tokenizer)
 
+# Opt-in only: real stories15M performance characterization. External model
+# files remain outside CTest so offline validation stays self-contained.
+add_executable(cuda_llama2_benchmark cuda_llama2_benchmark.cu)
+target_link_libraries(cuda_llama2_benchmark
+    PRIVATE cuda_llama2_checkpoint cuda_llama2_tokenizer)
+
 add_library(cuda_incremental_decoder_block STATIC cuda/incremental_decoder_block.cu)
 target_include_directories(cuda_incremental_decoder_block
     PUBLIC ${PROJECT_SOURCE_DIR}/include)

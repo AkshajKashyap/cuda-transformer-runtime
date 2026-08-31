@@ -12,6 +12,30 @@ per-execution latency. For fixed-history incremental measurements, K/V history
 is prefilled outside timing and `current_length` is restored before every
 launch, so the same deterministic position is overwritten each time.
 
+## Real stories15M characterization
+
+`cuda_llama2_benchmark checkpoint.bin tokenizer.bin` is the opt-in real-model
+baseline. Checkpoint/tokenizer loading, CUDA workspace creation, and the
+one-time upload of deterministic valid token IDs happen before every reported
+steady-state metric. CUDA events measure GPU-only sequential incremental
+prefill and full cached one-token model decode; prefill also has a wall-clock
+through-stream-completion row. Each event interval surrounds one launch, so
+host-side cache-length restoration is outside the interval; the final event is
+synchronized before elapsed time is read.
+
+The benchmark measures 32k-logit D2H transfer + stream synchronization and
+CPU greedy argmax with wall-clock samples separately. Its end-to-end greedy
+rows also use wall clock and include the existing per-token logits copy,
+synchronization, CPU argmax, and small host orchestration. They deliberately
+exclude checkpoint/tokenizer file loading and fixed-prompt tokenization.
+
+Trace only repeated fixed-context real-model decode with:
+
+```bash
+./build/src/cuda_llama2_benchmark models/stories15M.bin models/tokenizer.bin \
+  --trace-decode-context 128 --trace-iterations 20
+```
+
 ## End-to-end decoder-block decode
 
 | History | Full-prefix ms | Cached ms | Speedup |
