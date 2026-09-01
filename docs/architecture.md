@@ -5,6 +5,25 @@ pre-norm decoder blocks and a tiny model-level embedding-to-logits path. It
 deliberately exposes buffers and stages instead of hiding them behind a general
 tensor framework.
 
+## End-to-end execution
+
+The executable generation path is deliberately easy to trace:
+
+```text
+UTF-8 text → legacy BPE tokenizer → token IDs
+          → embedding lookup → N LLaMA-style decoder layers
+          → final RMSNorm → LM-head projection → logits
+          → host greedy argmax → next token → rendered text
+```
+
+Tokenizer encoding, token storage for convenience wrappers, logits readback,
+greedy selection, and text rendering are host responsibilities. Embedding,
+decoder layers, final normalization, and the LM head are CUDA/cuBLAS work. The
+core model APIs take device token IDs and device logits so a core forward does
+not inherently require a host-to-device copy. They enqueue work on the
+configured stream and return without a device-wide synchronization; tests and
+host greedy selection synchronize only when a result must be inspected.
+
 ## Layouts
 
 Full-sequence activations use contiguous row-major `[sequence, hidden]` storage.
@@ -193,6 +212,13 @@ the external cache must have matching capacities. This makes the allocation
 boundary explicit: after cache and workspace creation, successful production
 incremental decode does not call `cudaMalloc` or `cudaFree`.
 
+Persistent ownership is deliberately explicit: checkpoint loading owns adapted
+host/device weights; a full-model workspace owns activation ping-pong and
+per-layer scratch; an incremental workspace owns one independent cache and one
+incremental decoder workspace per layer. Inputs, output logits, and the cuBLAS
+handle remain caller-owned. Logical cache reset changes lengths only and
+preserves allocations and device pointer identities.
+
 ## Dependency direction
 
 The project keeps low-level ownership separate from higher-level composition:
@@ -216,3 +242,14 @@ Repository matrices are row-major. cuBLAS is column-major, so the linear helper
 views the same bytes as transposes and computes `C^T = B^T * A^T`; this produces
 row-major `C = A * B` without physical transpose buffers. The wrapper requests
 pedantic FP32 math so Ampere TF32 is not silently selected in this project.
+
+## CUDA Graph diagnostic boundary
+
+The repository includes an isolated fixed-context graph experiment, not a
+production graph execution path. It captures a single already-prefilled decode
+at a chosen history and replays it only after restoring the same logical cache
+length. RoPE position, cache append position, valid attention length, and some
+launch parameters are fixed by that capture. General autoregressive generation
+therefore cannot safely reuse the graph as context changes. Supporting dynamic
+contexts would require a deliberately designed graph/update strategy and
+validation for every changing dependency; that work is outside this runtime.

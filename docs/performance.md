@@ -1,100 +1,148 @@
-# Performance and profiling
+# Performance record
 
-## Measured configuration
+This is the authoritative measurement record for this repository. Results are
+specific to the stated workload and RTX 3050 Laptop GPU; they are not claims
+about other GPUs or production-serving throughput.
 
-Results below were collected on the RTX 3050 Laptop GPU in WSL2 for one FP32
-decoder block: batch 1, hidden 256, 4 heads × 64 head dimensions, intermediate
-size 512. CUDA events measure kernel-only latency. Allocations and host/device
-transfers are outside timed regions.
+## Environment and timing boundaries
 
-Each benchmark uses warmups, nine independent timing batches, and median
-per-execution latency. For fixed-history incremental measurements, K/V history
-is prefilled outside timing and `current_length` is restored before every
-launch, so the same deterministic position is overwritten each time.
+- WSL2 Ubuntu, NVIDIA GeForce RTX 3050 Laptop GPU (4 GiB), CUDA 13.3,
+  GCC 13.3, CMake/Ninja.
+- CMake generates explicit `sm_86` SASS for this development machine.
+- Real-model results use FP32 `stories15M`: dim 288, intermediate 768,
+  6 layers, 6 heads, vocabulary 32,000, context 256, batch 1.
 
-## Real stories15M characterization
+| Measurement | Clock | Excluded work |
+| --- | --- | --- |
+| GPU cached decode and sequential prefill | CUDA events | checkpoint/tokenizer loading, workspace allocation, uploads |
+| Logit selection | wall clock | setup; separates D2H+stream completion from CPU argmax when reported |
+| End-to-end generation | wall clock | checkpoint/tokenizer file loading and prompt tokenization |
+| Nsight trace | profiler timestamps | setup and prefill before the trace range |
 
-`cuda_llama2_benchmark checkpoint.bin tokenizer.bin` is the opt-in real-model
-baseline. Checkpoint/tokenizer loading, CUDA workspace creation, and the
-one-time upload of deterministic valid token IDs happen before every reported
-steady-state metric. CUDA events measure GPU-only sequential incremental
-prefill and full cached one-token model decode; prefill also has a wall-clock
-through-stream-completion row. Each event interval surrounds one launch, so
-host-side cache-length restoration is outside the interval; the final event is
-synchronized before elapsed time is read.
+The benchmark warms up before sampling and reports repeated measurements. For
+fixed-history decode, history is prepared before timing and logical cache length
+is restored between launches, so every interval represents the same position.
 
-The benchmark measures 32k-logit D2H transfer + stream synchronization and
-CPU greedy argmax with wall-clock samples separately. Its end-to-end greedy
-rows also use wall clock and include the existing per-token logits copy,
-synchronization, CPU argmax, and small host orchestration. They deliberately
-exclude checkpoint/tokenizer file loading and fixed-prompt tokenization.
+## Current normal-runtime baseline
 
-Trace only repeated fixed-context real-model decode with:
+| Workload | Result |
+| --- | ---: |
+| 64-token greedy continuation | about 266.8 tokens/s |
+| 64-token greedy continuation | about 3.748 ms/generated token |
+| Cached GPU decode at context 128 | about 2.30 ms in the original baseline sweep |
+| 32k logits D2H + synchronization + CPU greedy argmax | about 0.248 ms/token |
+
+The supplied release validation retained the headline values above. The benchmark
+still emits the per-row values below; rerun it before publishing a table that
+requires every raw row. This is deliberately explicit rather than inventing
+numbers that were not retained in the release notes.
+
+### Sequential correctness-first prefill scaling
+
+| Prefix length | GPU/event result |
+| ---: | --- |
+| 8 | Rerun benchmark for recorded raw row |
+| 16 | Rerun benchmark for recorded raw row |
+| 32 | Rerun benchmark for recorded raw row |
+| 64 | Rerun benchmark for recorded raw row |
+| 128 | Rerun benchmark for recorded raw row |
+
+Prefill is intentionally a repeated one-token cached decode path, not an
+optimized parallel prompt pass. It may compute final RMSNorm and LM-head logits
+for prefix tokens whose logits are not needed.
+
+### Fixed-context cached decode scaling
+
+| History | GPU/event result |
+| ---: | --- |
+| 8 | Rerun benchmark for recorded raw row |
+| 16 | Rerun benchmark for recorded raw row |
+| 32 | Rerun benchmark for recorded raw row |
+| 64 | Rerun benchmark for recorded raw row |
+| 128 | about 2.30 ms (original baseline sweep) |
+| 192 | Rerun benchmark for recorded raw row |
+| 255 | Rerun benchmark for recorded raw row |
+
+### Host logits selection
+
+| Component for device-produced `[1, 32000]` FP32 logits | Median/average record |
+| --- | --- |
+| D2H copy + required stream synchronization + CPU argmax | about 0.248 ms combined |
+| D2H + synchronization alone | Rerun benchmark for separate row |
+| CPU argmax scan alone | Rerun benchmark for separate row |
+
+### End-to-end greedy generation
+
+| New tokens | Wall-clock result |
+| ---: | --- |
+| 16 | Rerun benchmark for recorded raw row |
+| 32 | Rerun benchmark for recorded raw row |
+| 64 | about 266.8 tokens/s; about 3.748 ms/token |
+
+The end-to-end number includes current GPU cached decode, logit readback,
+stream synchronization, CPU argmax, and small host orchestration. It should
+not be compared directly to the CUDA-event-only decode number.
+
+## Nsight Systems diagnostic
+
+A context-128 fixed-context decode trace found the following per token:
+
+| Finding | Value |
+| --- | ---: |
+| GPU kernel launches | 141 |
+| cuBLAS GEMV launches | 43 |
+| Other, mostly tiny custom launches | 98 |
+| Summed GPU kernel execution | about 0.96 ms |
+
+This is profiling evidence that launch/orchestration overhead materially affects
+the current runtime. It is not a claim that summed kernel time equals API or
+end-to-end latency.
+
+## Isolated fixed-context CUDA Graph experiment
+
+This is a feasibility diagnostic, not the normal runtime path. At history 128,
+the graph captures one already-prefilled decode with fixed position/length and
+compares its replay with ordinary decode in the same run.
+
+| Measurement | Result |
+| --- | ---: |
+| Ordinary decode median | 2.54505 ms |
+| Graph replay median | 1.02687 ms |
+| Reduction | 1.51818 ms (59.65%) |
+| Replay speedup | 2.478× |
+| Graph logits error vs ordinary | 0 |
+| K/V cache state | expected byte-identical result |
+| Capture cost | 3.38975 ms |
+| Instantiation cost | 0.98026 ms |
+
+The graph cannot serve arbitrary generation: RoPE position, cache append slot,
+attention length, and some launch parameters are captured at one context. No
+2.478× general-generation or production-runtime claim is made.
+
+## Reproduction and profiling commands
 
 ```bash
-./build/src/cuda_llama2_benchmark models/stories15M.bin models/tokenizer.bin \
+./build/src/cuda_llama2_benchmark models/stories15M.bin models/tokenizer.bin
+
+nsys --version
+ncu --version
+nsys profile --trace=cuda,cublas --sample=none --capture-range=cudaProfilerApi \
+  --capture-range-end=stop --force-overwrite true -o decode_context128 \
+  ./build/src/cuda_llama2_benchmark models/stories15M.bin models/tokenizer.bin \
   --trace-decode-context 128 --trace-iterations 20
+
+./build/src/cuda_llama2_benchmark models/stories15M.bin models/tokenizer.bin \
+  --graph-decode-context 128
 ```
 
-## Fixed-context CUDA Graph experiment
-
-`--graph-decode-context 128` creates a dedicated non-default stream, pre-fills
-the real model outside capture, captures exactly one device-native decode, and
-instantiates one graph executable. Capture/instantiation wall time is reported
-separately. Before timing, it compares graph logits with ordinary decode using
-the existing FP32 tolerance and verifies byte-identical full K/V cache contents
-against ordinary decode. It restores host cache lengths before every replay,
-so this is valid only for the one captured context and is not production
-autoregressive graph support.
-
-## End-to-end decoder-block decode
-
-| History | Full-prefix ms | Cached ms | Speedup |
-| ---: | ---: | ---: | ---: |
-| 16 | 0.56269 | 0.44469 | 1.27× |
-| 32 | 0.47918 | 0.38257 | 1.25× |
-| 64 | 0.48190 | 0.41284 | 1.17× |
-| 128 | 0.47434 | 0.39564 | 1.20× |
-| 256 | 0.85171 | 0.42340 | 2.01× |
-| 512 | 2.42635 | 0.34323 | 7.07× |
-| 1024 | 7.86487 | 0.41812 | 18.81× |
-
-The full path recomputes a prefix of `S+1` tokens. Cached decode computes one
-new token against history `S`; it does not represent full-model throughput.
-
-## P×V microbenchmark
-
-| History | Serial µs | Cooperative µs | Speedup |
-| ---: | ---: | ---: | ---: |
-| 16 | 21.465 | 16.667 | 1.29× |
-| 32 | 18.334 | 22.112 | 0.83× |
-| 64 | 22.493 | 27.177 | 0.83× |
-| 128 | 17.183 | 22.036 | 0.78× |
-| 256 | 23.681 | 22.128 | 1.07× |
-| 512 | 30.474 | 22.697 | 1.34× |
-| 1024 | 64.338 | 25.118 | 2.56× |
-| 2048 | 211.456 | 47.870 | 4.42× |
-
-The serial kernel assigns one thread per `(head, output_dimension)` and loops
-over history. The cooperative version assigns one block per output element and
-reduces strided history partials in shared memory. Production uses serial below
-512 and cooperative at 512+, an empirical cutoff for this GPU and shape.
-
-## Nsight-driven changes
-
-Initial traces of 20 production decode calls showed three `cudaMalloc` and
-three `cudaFree` calls per token from rotated Q, rotated K, and score scratch.
-Those buffers moved into `IncrementalAttentionWorkspace`; steady-state decode
-now has zero dynamic GPU allocation. No precise cross-run speedup is claimed
-because laptop conditions vary.
-
-After that change, Nsight showed long-context P×V as the major custom-kernel
-bottleneck: at history 1024, the serial kernel was about 94 µs in the earlier
-profile. The controlled P×V benchmark above motivated the cooperative kernel.
+Use Nsight Systems to identify CPU/GPU timeline gaps, API overhead, launch
+counts, and cuBLAS activity. Use Nsight Compute only after a specific kernel is
+identified; it answers per-kernel occupancy, memory, and instruction questions
+but is not a whole-runtime timeline tool.
 
 ## Interpretation limits
 
-Laptop DVFS, thermal state, power limits, other GPU activity, and fixed launch
-overhead can make small workloads non-monotonic. CUDA event latency is neither
-CPU API time nor end-to-end application latency. Treat these as reproducible
-measurements for the stated workload, not universal performance claims.
+Laptop clocks, power limits, thermals, and background work can vary. Small
+workloads can be dominated by fixed launch overhead, making rows non-monotonic.
+CUDA events measure queued GPU work, not host API time; wall-clock generation
+includes host work. Measure again before drawing an optimization conclusion.
